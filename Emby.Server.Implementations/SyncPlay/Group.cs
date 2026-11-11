@@ -174,6 +174,16 @@ namespace Emby.Server.Implementations.SyncPlay
         public DateTime LastActivity { get; set; }
 
         /// <summary>
+        /// Gets or sets the identifier of the session catching up to the group position, if any.
+        /// </summary>
+        public string CatchUpSessionId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the UTC time at which the catching-up session reaches the group position.
+        /// </summary>
+        public DateTime? CatchUpUntil { get; set; }
+
+        /// <summary>
         /// Adds the session to the group.
         /// </summary>
         /// <param name="session">The session.</param>
@@ -222,6 +232,10 @@ namespace Emby.Server.Implementations.SyncPlay
                 SyncPlayBroadcastType.AllReady => _participants
                     .Values
                     .Where(member => !member.IsBuffering)
+                    .Select(member => member.SessionId),
+                SyncPlayBroadcastType.AllReadyExceptCatchUp => _participants
+                    .Values
+                    .Where(member => !member.IsBuffering && !string.Equals(member.SessionId, CatchUpSessionId, StringComparison.OrdinalIgnoreCase))
                     .Select(member => member.SessionId),
                 _ => Enumerable.Empty<string>()
             };

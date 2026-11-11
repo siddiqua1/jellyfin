@@ -119,7 +119,7 @@ public class WaitingGroupStateTests
     }
 
     [Fact]
-    public void Ready_PlayingSessionAheadOfGroup_IsNotCorrected()
+    public void Ready_PlayingSessionAheadOfGroup_IsCorrectedAtMostOnce()
     {
         var harness = new GroupHarness();
         var group = harness.Group;
@@ -139,24 +139,27 @@ public class WaitingGroupStateTests
             CancellationToken.None);
 
         harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
 
         // This session applied the seek and kept playing while the group waited for the other
         // member, so it is now ten seconds ahead of the frozen group position. It must be
-        // paused, not seeked, or the client answers every seek with another ready report.
+        // corrected, but only once: a seek makes the client report ready again while it is
+        // still ahead, and correcting every report loops until the group wait timeout.
         var ahead = group.PositionTicks + TimeSpan.FromSeconds(10).Ticks;
-        state.HandleRequest(
-            new ReadyGroupRequest(DateTime.UtcNow, ahead, true, harness.PlaylistItemId),
-            group,
-            GroupStateType.Waiting,
-            harness.First,
-            CancellationToken.None);
+        for (var i = 0; i < 5; i++)
+        {
+            group.HandleRequest(
+                harness.First,
+                new ReadyGroupRequest(DateTime.UtcNow, ahead, true, harness.PlaylistItemId),
+                CancellationToken.None);
+        }
 
-        Assert.DoesNotContain(harness.Commands, c => c.Command == SendCommandType.Seek);
-        Assert.Contains(harness.Commands, c => c.Command == SendCommandType.Pause);
+        var seeks = harness.CommandsTo(harness.First.Id, SendCommandType.Seek);
+        Assert.Single(seeks);
     }
 
     [Fact]
-    public void Ready_LastSessionIsAhead_GroupResumesAtTheGroupPosition()
+    public void Ready_LastSessionSlightlyAhead_GroupResumesAtTheGroupPosition()
     {
         var harness = new GroupHarness();
         var group = harness.Group;
@@ -176,7 +179,8 @@ public class WaitingGroupStateTests
 
         harness.Commands.Clear();
 
-        var ahead = group.PositionTicks + TimeSpan.FromSeconds(10).Ticks;
+        // Within the tolerated offset, the last session is accepted as ready.
+        var ahead = group.PositionTicks + TimeSpan.FromMilliseconds(200).Ticks;
         state.HandleRequest(
             new ReadyGroupRequest(DateTime.UtcNow, ahead, true, harness.PlaylistItemId),
             group,
@@ -184,7 +188,6 @@ public class WaitingGroupStateTests
             harness.First,
             CancellationToken.None);
 
-        // The last session is ahead as well, so the group must not seek it before resuming.
         // The unpause command carries the group position and brings every client back in sync.
         state.HandleRequest(
             new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks, true, harness.PlaylistItemId),
@@ -489,6 +492,139 @@ public class WaitingGroupStateTests
         Assert.NotNull(group.GroupWaitDeadline);
     }
 
+    [Fact]
+    public void Buffer_DuringCatchUp_DoesNotCancelTheCatchUp()
+    {
+        var harness = new GroupHarness();
+        var group = harness.Group;
+
+        group.UpdatePing(harness.First, 10);
+        group.UpdatePing(harness.Second, 10);
+        group.PositionTicks = TimeSpan.FromMinutes(10).Ticks;
+        group.LastActivity = DateTime.UtcNow;
+
+        var state = new WaitingGroupState(NullLoggerFactory.Instance) { ResumePlaying = true };
+        group.SetState(state);
+
+        // First buffers and comes back two seconds behind while still playing.
+        state.HandleRequest(
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, true, harness.PlaylistItemId),
+            group,
+            GroupStateType.Playing,
+            harness.First,
+            CancellationToken.None);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        group.HandleRequest(
+            harness.First,
+            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks - TimeSpan.FromSeconds(2).Ticks, true, harness.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(harness.First.Id, group.CatchUpSessionId);
+        Assert.NotNull(group.CatchUpUntil);
+        var catchUpUntil = group.CatchUpUntil.Value;
+
+        var scheduledUnpause = Assert.Single(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+        Assert.True(scheduledUnpause.When >= catchUpUntil.AddMilliseconds(-100), "the other session must wait for the catch-up");
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // Second starts buffering during the catch-up. It must not pause or seek First: First
+        // is still playing towards the group position, and pausing it would seek it forward and
+        // skip the content it is catching up on.
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, false, harness.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Empty(harness.CommandsTo(harness.First.Id, SendCommandType.Pause));
+        Assert.Empty(harness.CommandsTo(harness.First.Id, SendCommandType.Seek));
+        Assert.Equal(harness.First.Id, group.CatchUpSessionId);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // Second finishes loading before First reaches the group position. The group must
+        // resume when First gets there, not immediately.
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks, false, harness.PlaylistItemId),
+            CancellationToken.None);
+
+        var unpauses = harness.DeliveredCommands
+            .Where(delivery => delivery.Command.Command == SendCommandType.Unpause)
+            .ToList();
+        Assert.NotEmpty(unpauses);
+        Assert.All(unpauses, delivery => Assert.Equal(group.PositionTicks, delivery.Command.PositionTicks));
+        Assert.All(
+            unpauses,
+            delivery => Assert.True(
+                delivery.Command.When >= catchUpUntil.AddMilliseconds(-100),
+                $"group resumed at {delivery.Command.When:O}, before the catch-up deadline {catchUpUntil:O}"));
+        Assert.Null(group.CatchUpSessionId);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(150)]
+    [InlineData(800)]
+    [InlineData(1500)]
+    [InlineData(2500)]
+    [InlineData(4000)]
+    public void Ready_PlayingSessionReportsAStalePosition_VaryingLatencyIsCompensated(int latencyMilliseconds)
+    {
+        var harness = new GroupHarness();
+        var group = harness.Group;
+
+        group.UpdatePing(harness.First, 10);
+        group.UpdatePing(harness.Second, 10);
+        group.PositionTicks = TimeSpan.FromMinutes(10).Ticks;
+        group.LastActivity = DateTime.UtcNow;
+
+        // Both sessions are buffering, so a ready report pauses the session instead of resuming
+        // the group. This keeps the scheduled command observable.
+        group.SetBuffering(harness.First, true);
+        group.SetBuffering(harness.Second, true);
+
+        var state = new WaitingGroupState(NullLoggerFactory.Instance) { ResumePlaying = true };
+
+        // The session was at the group position when it sent the report, but the report takes
+        // the given stream latency to arrive. Time sync compensates it only up to TimeSyncOffset.
+        var latency = TimeSpan.FromMilliseconds(latencyMilliseconds);
+        var reportTime = DateTime.UtcNow - latency;
+        var positionWhenSent = group.PositionTicks - latency.Ticks;
+
+        var before = DateTime.UtcNow;
+        state.HandleRequest(
+            new ReadyGroupRequest(reportTime, positionWhenSent, true, harness.PlaylistItemId),
+            group,
+            GroupStateType.Waiting,
+            harness.First,
+            CancellationToken.None);
+
+        // A session that is behind after a buffer is catching up, not lost. It must never be
+        // seeked (that would skip content), regardless of the transport latency.
+        Assert.Empty(harness.CommandsTo(harness.First.Id, SendCommandType.Seek));
+
+        var pause = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Pause));
+        var scheduledDelay = (pause.When - before).TotalMilliseconds;
+
+        if (latencyMilliseconds <= group.TimeSyncOffset)
+        {
+            // The elapsed time is used, so the latency is compensated and the pause is due now.
+            Assert.InRange(scheduledDelay, -100.0, 300.0);
+        }
+        else
+        {
+            // The report is older than TimeSyncOffset: the elapsed time is ignored, the session
+            // is treated as behind by the latency, and the pause is scheduled for when it arrives.
+            Assert.InRange(scheduledDelay, latencyMilliseconds - 250.0, latencyMilliseconds + 250.0);
+        }
+    }
+
     private sealed class GroupHarness
     {
         private readonly ISessionManager _sessionManager;
@@ -510,7 +646,11 @@ public class WaitingGroupStateTests
 
             sessionManager
                 .Setup(m => m.SendSyncPlayCommand(It.IsAny<string>(), It.IsAny<SendCommand>(), It.IsAny<CancellationToken>()))
-                .Callback<string, SendCommand, CancellationToken>((_, command, _) => Commands.Add(command))
+                .Callback<string, SendCommand, CancellationToken>((sessionId, command, _) =>
+                {
+                    Commands.Add(command);
+                    DeliveredCommands.Add((sessionId, command));
+                })
                 .Returns(Task.CompletedTask);
 
             sessionManager
@@ -550,6 +690,22 @@ public class WaitingGroupStateTests
         public Guid PlaylistItemId { get; }
 
         public List<SendCommand> Commands { get; } = new List<SendCommand>();
+
+        /// <summary>
+        /// Gets the commands as delivered, with the session that received each one.
+        /// </summary>
+        public List<(string SessionId, SendCommand Command)> DeliveredCommands { get; } = new();
+
+        /// <summary>
+        /// Gets the commands of the given type delivered to a session.
+        /// </summary>
+        public List<SendCommand> CommandsTo(string sessionId, SendCommandType type)
+        {
+            return DeliveredCommands
+                .Where(delivery => delivery.SessionId == sessionId && delivery.Command.Command == type)
+                .Select(delivery => delivery.Command)
+                .ToList();
+        }
 
         // Mirrors the sweep SyncPlayManager runs on a timer.
         public void PumpGroupWaitTimeout()

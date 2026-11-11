@@ -58,6 +58,16 @@ namespace MediaBrowser.Controller.SyncPlay
         DateTime LastActivity { get; set; }
 
         /// <summary>
+        /// Gets or sets the identifier of the session that is catching up to the group position, if any.
+        /// </summary>
+        string CatchUpSessionId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the UTC time at which the catching-up session is expected to reach the group position.
+        /// </summary>
+        DateTime? CatchUpUntil { get; set; }
+
+        /// <summary>
         /// Gets the play queue.
         /// </summary>
         /// <value>The play queue.</value>

@@ -23,6 +23,11 @@ namespace MediaBrowser.Model.SyncPlay
         /// <summary>
         /// Only sessions that are not buffering will receive the message.
         /// </summary>
-        AllReady = 3
+        AllReady = 3,
+
+        /// <summary>
+        /// Only sessions that are not buffering, except the session catching up to the group position, will receive the message.
+        /// </summary>
+        AllReadyExceptCatchUp = 4
     }
 }
