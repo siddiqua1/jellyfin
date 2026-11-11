@@ -17,4 +17,14 @@ RUN --mount=type=cache,target=/root/.nuget/packages \
 # the /config layout used by the running deployment.
 FROM lscr.io/linuxserver/jellyfin@sha256:2f708001387aa9853e744a4a4d572d9970927c479c56d6c9e199f789c5173535
 
+# The bundled web client crashes the SyncPlay group menu with
+# "c.find is not a function" when the users query does not return an array.
+# Guard the call until the bundled client is updated (the base image is pinned).
+RUN if grep -q 'c\.find((function(t){return t\.Name===e}))' /usr/share/jellyfin/web/main.jellyfin.bundle.js; then \
+        sed -i 's/c\.find((function(t){return t\.Name===e}))/c.find?.((function(t){return t.Name===e}))/' /usr/share/jellyfin/web/main.jellyfin.bundle.js; \
+    else \
+        echo "SyncPlay web bundle guard no longer applies" >&2; \
+        exit 1; \
+    fi
+
 COPY --from=build /out/ /usr/lib/jellyfin/bin/
