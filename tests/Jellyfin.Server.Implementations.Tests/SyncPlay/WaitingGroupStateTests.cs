@@ -119,6 +119,172 @@ public class WaitingGroupStateTests
     }
 
     [Fact]
+    public void Ready_PlayingSessionAheadOfGroup_IsNotCorrected()
+    {
+        var harness = new GroupHarness();
+        var group = harness.Group;
+
+        group.PositionTicks = TimeSpan.FromMinutes(10).Ticks;
+        group.LastActivity = DateTime.UtcNow;
+
+        var state = new WaitingGroupState(NullLoggerFactory.Instance) { ResumePlaying = true };
+        group.SetState(state);
+
+        // Another member seeks, freezing the group position until everyone is ready.
+        state.HandleRequest(
+            new SeekGroupRequest(TimeSpan.FromMinutes(20).Ticks),
+            group,
+            GroupStateType.Playing,
+            harness.Second,
+            CancellationToken.None);
+
+        harness.Commands.Clear();
+
+        // This session applied the seek and kept playing while the group waited for the other
+        // member, so it is now ten seconds ahead of the frozen group position. It must be
+        // paused, not seeked, or the client answers every seek with another ready report.
+        var ahead = group.PositionTicks + TimeSpan.FromSeconds(10).Ticks;
+        state.HandleRequest(
+            new ReadyGroupRequest(DateTime.UtcNow, ahead, true, harness.PlaylistItemId),
+            group,
+            GroupStateType.Waiting,
+            harness.First,
+            CancellationToken.None);
+
+        Assert.DoesNotContain(harness.Commands, c => c.Command == SendCommandType.Seek);
+        Assert.Contains(harness.Commands, c => c.Command == SendCommandType.Pause);
+    }
+
+    [Fact]
+    public void Ready_LastSessionIsAhead_GroupResumesAtTheGroupPosition()
+    {
+        var harness = new GroupHarness();
+        var group = harness.Group;
+
+        group.PositionTicks = TimeSpan.FromMinutes(10).Ticks;
+        group.LastActivity = DateTime.UtcNow;
+
+        var state = new WaitingGroupState(NullLoggerFactory.Instance) { ResumePlaying = true };
+        group.SetState(state);
+
+        state.HandleRequest(
+            new SeekGroupRequest(TimeSpan.FromMinutes(20).Ticks),
+            group,
+            GroupStateType.Playing,
+            harness.Second,
+            CancellationToken.None);
+
+        harness.Commands.Clear();
+
+        var ahead = group.PositionTicks + TimeSpan.FromSeconds(10).Ticks;
+        state.HandleRequest(
+            new ReadyGroupRequest(DateTime.UtcNow, ahead, true, harness.PlaylistItemId),
+            group,
+            GroupStateType.Waiting,
+            harness.First,
+            CancellationToken.None);
+
+        // The last session is ahead as well, so the group must not seek it before resuming.
+        // The unpause command carries the group position and brings every client back in sync.
+        state.HandleRequest(
+            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks, true, harness.PlaylistItemId),
+            group,
+            GroupStateType.Waiting,
+            harness.Second,
+            CancellationToken.None);
+
+        Assert.DoesNotContain(harness.Commands, c => c.Command == SendCommandType.Seek);
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+
+        var unpauses = harness.Commands.Where(c => c.Command == SendCommandType.Unpause).ToList();
+        Assert.NotEmpty(unpauses);
+        Assert.All(unpauses, command => Assert.Equal(group.PositionTicks, command.PositionTicks));
+    }
+
+    [Fact]
+    public void Buffer_FromPausedSessionAtGroupPosition_DoesNotBlockTheGroup()
+    {
+        var harness = new GroupHarness();
+        var group = harness.Group;
+
+        group.PositionTicks = TimeSpan.FromMinutes(10).Ticks;
+        group.LastActivity = DateTime.UtcNow;
+
+        var state = new WaitingGroupState(NullLoggerFactory.Instance) { ResumePlaying = true };
+        group.SetState(state);
+
+        state.HandleRequest(
+            new SeekGroupRequest(TimeSpan.FromMinutes(20).Ticks),
+            group,
+            GroupStateType.Playing,
+            harness.Second,
+            CancellationToken.None);
+
+        harness.Commands.Clear();
+
+        // The group paused this member while waiting for another session. The pause issued a
+        // seek, which made the paused player emit a buffering event at the group position.
+        // The member must not be waited for, since a paused player never reports ready on its
+        // own; otherwise the group stays stuck until the wait timeout.
+        state.HandleRequest(
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, false, harness.PlaylistItemId),
+            group,
+            GroupStateType.Waiting,
+            harness.First,
+            CancellationToken.None);
+
+        state.HandleRequest(
+            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks, true, harness.PlaylistItemId),
+            group,
+            GroupStateType.Waiting,
+            harness.Second,
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.DoesNotContain(harness.Commands, c => c.Command == SendCommandType.Seek);
+    }
+
+    [Fact]
+    public void Buffer_FromPausedSessionBehindGroupPosition_StillBlocksTheGroup()
+    {
+        var harness = new GroupHarness();
+        var group = harness.Group;
+
+        group.PositionTicks = TimeSpan.FromMinutes(10).Ticks;
+        group.LastActivity = DateTime.UtcNow;
+
+        var state = new WaitingGroupState(NullLoggerFactory.Instance) { ResumePlaying = true };
+        group.SetState(state);
+
+        state.HandleRequest(
+            new SeekGroupRequest(TimeSpan.FromMinutes(20).Ticks),
+            group,
+            GroupStateType.Playing,
+            harness.Second,
+            CancellationToken.None);
+
+        harness.Commands.Clear();
+
+        // This session has not reached the group position yet, so it is really still loading
+        // and must keep the group waiting.
+        state.HandleRequest(
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks - TimeSpan.FromSeconds(10).Ticks, false, harness.PlaylistItemId),
+            group,
+            GroupStateType.Waiting,
+            harness.First,
+            CancellationToken.None);
+
+        state.HandleRequest(
+            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks, true, harness.PlaylistItemId),
+            group,
+            GroupStateType.Waiting,
+            harness.Second,
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+    }
+
+    [Fact]
     public void Ready_PausedSessionOutOfPosition_IsStillCorrected()
     {
         var harness = new GroupHarness();

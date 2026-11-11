@@ -353,6 +353,27 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 return;
             }
 
+            // A paused client that reports buffering while already at the group position is not
+            // going to report ready on its own: playback is paused, so no ready event will fire.
+            // This happens when the group pauses the existing members because a new session
+            // joined, and their pause triggers a seek that makes the player emit a buffering
+            // event. Waiting for such a session stalls the whole group until the wait timeout.
+            // An unpaused session is genuinely loading, and one that is behind the group still
+            // has something to load, so only accept the paused and in-position case.
+            var maxPlaybackOffsetTicks = TimeSpan.FromMilliseconds(context.MaxPlaybackOffset).Ticks;
+            if (!request.IsPlaying
+                && !prevState.Equals(GroupStateType.Playing)
+                && request.PositionTicks >= context.PositionTicks - maxPlaybackOffsetTicks)
+            {
+                HandleRequest(
+                    new ReadyGroupRequest(request.When, request.PositionTicks, false, request.PlaylistItemId),
+                    context,
+                    prevState,
+                    session,
+                    cancellationToken);
+                return;
+            }
+
             if (prevState.Equals(GroupStateType.Playing))
             {
                 // Resume playback when all ready.
@@ -461,11 +482,19 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // it has no clue of the real position nor the playback state.
                 // A jump means the session has not applied the new position; without one it is
                 // catching up after buffering and is allowed to lag.
-                var maxOffsetTicks = request.IsPlaying && !PositionJumped
+                var maxBehindTicks = request.IsPlaying && !PositionJumped
                     ? TimeSpan.FromMilliseconds(context.MaxCatchUpOffset).Ticks
                     : maxPlaybackOffsetTicks;
 
-                if (Math.Abs(delayTicks) > maxOffsetTicks)
+                // Only a session behind the group position is lost: it has not applied the
+                // latest seek or play request. A session ahead of the group position is not a
+                // problem. It may have kept playing while the group waited for slower members,
+                // it does not hold the group back, and the group resumes by seeking everyone
+                // (including this session) to the group position. Rejecting it here makes the
+                // server send a seek for every ready report, which the client answers with
+                // another ready report: an endless correction loop that eventually trips the
+                // group wait timeout.
+                if (delayTicks > maxBehindTicks)
                 {
                     // Session not ready at all.
                     context.SetBuffering(session, true);
