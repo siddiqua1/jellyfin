@@ -1,0 +1,28 @@
+services:
+  jellyfin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - SERVICE_FQDN_JELLYFIN_8096
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Tashkent
+      - JELLYFIN_PublishedServerUrl=$SERVICE_FQDN_JELLYFIN
+    ports:
+      - '8096:8096'
+    volumes:
+      - '/mnt/anidrive/data/media:/data/media'
+      - '/home/shared/jellyfin:/config'
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - '-f'
+        - 'http://127.0.0.1:8096'
+      interval: 2s
+      timeout: 10s
+      retries: 15
