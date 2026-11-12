@@ -100,6 +100,47 @@ client-side network inspector showing `SyncPlayCommand` messages with `Command`,
    re-plans the wait, but a recovery that still describes the frozen position stays active until
    its deadline.
 
+## Scenario G: immediate Pause while another member is buffering
+
+1. Repeat step 2 of Scenario A so A is recovering, then make B buffer.
+2. Press Pause in the group while B is still loading.
+3. Expected server commands: A receives an immediate `Pause` that replaces its future recovery
+   stop; any deferred resume is cancelled. Advancing the server sweep must not unpause anyone.
+4. Expected playback: A stops promptly instead of playing until its former deadline.
+
+## Scenario H: repeated Ready and Playing-state resynchronization
+
+1. Set up a first recovery with about five seconds remaining and a second recovery with about one
+   second remaining. The second member's last command is its one-second stop.
+2. Have that member report Ready again, then in a fresh run send Unpause while the group is
+   already Playing, before the one-second stop.
+3. Expected: the next command for the member remains the stop at the same time; the deferred
+   resume for the group start follows it. Re-sending state information must not replace the stop
+   with a five-second unpause.
+
+## Scenario I: short recovery under high latency
+
+1. Give both members pings around 1,200 ms. While one member buffers, have the other report ready
+   one second behind, then have the buffering member report ready five seconds behind.
+2. Expected: the one-second stop remains in effect, that member waits at the target, and resumes
+   with the group at the later deadline plus the normal latency allowance.
+
+## Scenario J: buffering report at the planned recovery stop
+
+1. Set up a five-second recovery and a 300-millisecond recovery. Let the short stop take effect
+   and its player emit a paused, in-position buffering report for the current item before the
+   group start.
+2. Expected: the group stays Playing, the short member is not a new blocking loader, and its
+   deferred resume is delivered at the planned start without another Ready report. A behind-target
+   paused report, a playing report, or a stale item must still be treated as genuine loading.
+
+## Scenario K: unrelated departure between stop and resume delivery
+
+1. Use three members: a five-second recovery, a 300-millisecond recovery, and a third member.
+2. After the short stop and before the sweep delivers its resume, have the third member leave.
+3. Expected: the group start and the short member's deferred resume are unchanged. Repeating the
+   sweep must not deliver a different plan or seek the member.
+
 ## Recorded outcomes
 
 No multi-client run has been recorded yet. Mark each scenario passed only after observing the

@@ -84,9 +84,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             }
             else
             {
-                // Client got lost, sending current state.
-                var command = context.NewSyncPlayCommand(SendCommandType.Unpause);
-                context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
+                // Client got lost, sending the command of its current playback plan.
+                context.SendCurrentPlaybackPlanTo(session, cancellationToken);
             }
         }
 
@@ -125,6 +124,18 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 return;
             }
 
+            // A session that already stopped at the target as part of the current plan is paused
+            // there on purpose. The seek that applies the stop can make the player emit another
+            // buffering event; that report must not restart the wait and cancel the resume that
+            // is owed to the session. The playlist item stays validated below, so a report for
+            // another timeline still follows the normal path.
+            if (!request.IsPlaying
+                && request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId())
+                && context.IsAtPlannedRecoveryStop(session, request.PositionTicks))
+            {
+                return;
+            }
+
             // Change state.
             var waitingState = new WaitingGroupState(LoggerFactory);
             context.SetState(waitingState);
@@ -136,9 +147,9 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         {
             if (prevState.Equals(Type))
             {
-                // Group was not waiting, make sure client has latest state.
-                var command = context.NewSyncPlayCommand(SendCommandType.Unpause);
-                context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
+                // Group was not waiting, make sure the client has the command of its current
+                // playback plan without cancelling a pending recovery stop.
+                context.SendCurrentPlaybackPlanTo(session, cancellationToken);
             }
             else if (prevState.Equals(GroupStateType.Waiting))
             {

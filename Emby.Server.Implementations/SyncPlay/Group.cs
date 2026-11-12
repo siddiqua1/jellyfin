@@ -134,6 +134,9 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <value>The maximum offset error.</value>
         public long MaxPlaybackOffset { get; } = 500;
 
+        /// <inheritdoc />
+        public long MaxPlaybackOffsetTicks => TimeSpan.FromMilliseconds(MaxPlaybackOffset).Ticks;
+
         /// <summary>
         /// Gets the maximum time, in milliseconds, the group waits for its members to report ready.
         /// </summary>
@@ -233,6 +236,14 @@ namespace Emby.Server.Implementations.SyncPlay
         }
 
         /// <inheritdoc />
+        public bool IsAtPlannedRecoveryStop(SessionInfo session, long positionTicks)
+        {
+            return session is not null
+                && _scheduledRecoveryResumes.ContainsKey(session.Id)
+                && positionTicks >= PositionTicks - MaxPlaybackOffsetTicks;
+        }
+
+        /// <inheritdoc />
         public IReadOnlyList<PlaybackRecovery> GetActiveRecoveries(DateTime currentTime)
         {
             PruneRecoveries(currentTime);
@@ -245,9 +256,7 @@ namespace Emby.Server.Implementations.SyncPlay
             foreach (var recovery in GetActiveRecoveries(currentTime))
             {
                 // Keep the session playing towards the frozen group position, but stop it there.
-                var command = NewSyncPlayCommand(SendCommandType.Pause);
-                command.When = recovery.ExpectedCompletion;
-                SendCommandToSession(recovery.SessionId, command, cancellationToken);
+                SendRecoveryStop(recovery, cancellationToken);
             }
         }
 
@@ -306,6 +315,55 @@ namespace Emby.Server.Implementations.SyncPlay
         }
 
         /// <inheritdoc />
+        public void SendCurrentPlaybackPlanTo(SessionInfo session, CancellationToken cancellationToken)
+        {
+            foreach (var recovery in GetActiveRecoveries(DateTime.UtcNow))
+            {
+                if (!string.Equals(recovery.SessionId, session.Id, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // The plan only stops a session whose lead over the start would exceed the
+                // accepted position tolerance; use the same rule here.
+                var leadTicks = LastActivity.Ticks - recovery.ExpectedCompletion.Ticks;
+                if (leadTicks > MaxPlaybackOffsetTicks)
+                {
+                    // The session is still advancing towards the group position: keep the stop
+                    // that the current plan scheduled for it.
+                    SendRecoveryStop(recovery, cancellationToken);
+                    return;
+                }
+
+                break;
+            }
+
+            if (_scheduledRecoveryResumes.TryGetValue(session.Id, out var scheduled))
+            {
+                // The session already stopped at the position; deliver the resume it is owed at
+                // the planned start.
+                var resume = NewSyncPlayCommand(SendCommandType.Unpause);
+                resume.When = scheduled.ResumeAt;
+                SendCommandToSession(session.Id, resume, cancellationToken);
+                return;
+            }
+
+            SendCommandToSession(session.Id, NewSyncPlayCommand(SendCommandType.Unpause), cancellationToken);
+        }
+
+        /// <summary>
+        /// Sends the command that stops a recovering session at the group position when it gets there.
+        /// </summary>
+        /// <param name="recovery">The recovery to stop.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        private void SendRecoveryStop(PlaybackRecovery recovery, CancellationToken cancellationToken)
+        {
+            var command = NewSyncPlayCommand(SendCommandType.Pause);
+            command.When = recovery.ExpectedCompletion;
+            SendCommandToSession(recovery.SessionId, command, cancellationToken);
+        }
+
+        /// <inheritdoc />
         public IReadOnlyCollection<string> PrepareGroupResume(DateTime resumeAt, CancellationToken cancellationToken)
         {
             ClearRecoveryResumes();
@@ -316,18 +374,20 @@ namespace Emby.Server.Implementations.SyncPlay
             var deferred = new List<string>();
             foreach (var recovery in GetActiveRecoveries(DateTime.UtcNow))
             {
-                if (recovery.ExpectedCompletion >= resumeAt)
+                // How far ahead of the frozen position the session would be if it kept playing
+                // until the group starts instead of stopping at its target.
+                var leadTicks = resumeAt.Ticks - recovery.ExpectedCompletion.Ticks;
+                if (leadTicks <= MaxPlaybackOffsetTicks)
                 {
-                    // This session reaches the group position when the group starts; the resume
+                    // The session reaches the group position when the group starts, or would run
+                    // ahead of it by no more than the accepted position tolerance. The resume
                     // command itself replaces any pause that was scheduled for it.
                     continue;
                 }
 
-                // The session reaches the group position before the group starts: make sure it
-                // stops there, and resume it once it has actually arrived.
-                var command = NewSyncPlayCommand(SendCommandType.Pause);
-                command.When = recovery.ExpectedCompletion;
-                SendCommandToSession(recovery.SessionId, command, cancellationToken);
+                // The session reaches the group position well before the group starts: make sure
+                // it stops there, and resume it once it has actually arrived.
+                SendRecoveryStop(recovery, cancellationToken);
 
                 _scheduledRecoveryResumes[recovery.SessionId] = new ScheduledRecoveryResume(recovery.ExpectedCompletion, resumeAt);
                 deferred.Add(recovery.SessionId);
@@ -392,26 +452,40 @@ namespace Emby.Server.Implementations.SyncPlay
             }
 
             var playingItemId = PlayQueue.GetPlayingItemPlaylistId();
-            List<string> stale = null;
+            List<string> completed = null;
+            List<string> obsolete = null;
             foreach (var (sessionId, recovery) in _recoveries)
             {
-                if (recovery.ExpectedCompletion <= currentTime
-                    || !recovery.PlaylistItemId.Equals(playingItemId)
+                if (!recovery.PlaylistItemId.Equals(playingItemId)
                     || recovery.TargetPositionTicks != PositionTicks
                     || !_participants.ContainsKey(sessionId))
                 {
-                    (stale ??= new()).Add(sessionId);
+                    // The playback timeline is no longer the one the recovery belongs to; any
+                    // resume deferred for it must be cancelled too.
+                    (obsolete ??= new()).Add(sessionId);
+                }
+                else if (recovery.ExpectedCompletion <= currentTime)
+                {
+                    // The advancing phase is over, but a resume may still be owed to the session
+                    // until the sweep delivers it. Only the recovery itself is removed here.
+                    (completed ??= new()).Add(sessionId);
                 }
             }
 
-            if (stale is null)
+            if (completed is not null)
             {
-                return;
+                foreach (var sessionId in completed)
+                {
+                    _recoveries.Remove(sessionId);
+                }
             }
 
-            foreach (var sessionId in stale)
+            if (obsolete is not null)
             {
-                RemoveRecovery(sessionId);
+                foreach (var sessionId in obsolete)
+                {
+                    RemoveRecovery(sessionId);
+                }
             }
         }
 

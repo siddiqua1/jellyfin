@@ -34,6 +34,12 @@ namespace MediaBrowser.Controller.SyncPlay
         long MaxPlaybackOffset { get; }
 
         /// <summary>
+        /// Gets the maximum offset error accepted for position reported by clients, in ticks.
+        /// </summary>
+        /// <value>The maximum offset error accepted, in ticks.</value>
+        long MaxPlaybackOffsetTicks => TimeSpan.FromMilliseconds(MaxPlaybackOffset).Ticks;
+
+        /// <summary>
         /// Gets the maximum offset accepted for a session catching up after buffering, in milliseconds.
         /// </summary>
         /// <value>The maximum catch-up offset, in milliseconds.</value>
@@ -88,6 +94,15 @@ namespace MediaBrowser.Controller.SyncPlay
         void ClearRecoveryResumes();
 
         /// <summary>
+        /// Gets whether a position reported by a session belongs to the planned recovery stop it
+        /// already performed, so that a pause-induced buffer report does not start a new wait.
+        /// </summary>
+        /// <param name="session">The session.</param>
+        /// <param name="positionTicks">The position reported by the session.</param>
+        /// <returns><c>true</c> if the report matches a planned recovery stop; <c>false</c> otherwise.</returns>
+        bool IsAtPlannedRecoveryStop(SessionInfo session, long positionTicks);
+
+        /// <summary>
         /// Gets the recoveries that are still expected to complete at the given UTC time.
         /// Recoveries that belong to a previous playback timeline are discarded.
         /// </summary>
@@ -129,6 +144,15 @@ namespace MediaBrowser.Controller.SyncPlay
         /// <param name="from">The session that caused the change.</param>
         /// <param name="cancellationToken">The cancellation token.</param>
         void RefreshScheduledStart(SessionInfo from, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Sends the command that belongs to the current playback plan to a single session.
+        /// A pending recovery stop is kept, and a resume that is still owed is scheduled, instead
+        /// of replacing the plan with a generic playback state.
+        /// </summary>
+        /// <param name="session">The session requesting the current state.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        void SendCurrentPlaybackPlanTo(SessionInfo session, CancellationToken cancellationToken);
 
         /// <summary>
         /// Prepares the commands that let recoveries finishing before the given resume time stop

@@ -290,6 +290,13 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             // Wait for sessions to be ready, then switch to paused state.
             ResumePlaying = false;
 
+            // Sessions that are still playing, including a recovering one, must be stopped now
+            // instead of waiting for their obsolete recovery deadlines or for a buffering member
+            // to report ready. The command also replaces their scheduled stop and any deferred
+            // resume that was owed to them.
+            var command = context.NewSyncPlayCommand(SendCommandType.Pause);
+            context.SendCommand(session, SyncPlayBroadcastType.AllGroup, command, cancellationToken);
+
             // Notify relevant state change event.
             SendGroupStateUpdate(context, request, session, cancellationToken);
         }
@@ -381,7 +388,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             // event. Waiting for such a session stalls the whole group until the wait timeout.
             // An unpaused session is genuinely loading, and one that is behind the group still
             // has something to load, so only accept the paused and in-position case.
-            var maxPlaybackOffsetTicks = TimeSpan.FromMilliseconds(context.MaxPlaybackOffset).Ticks;
+            var maxPlaybackOffsetTicks = context.MaxPlaybackOffsetTicks;
+
             if (!request.IsPlaying
                 && !prevState.Equals(GroupStateType.Playing)
                 && request.PositionTicks >= context.PositionTicks - maxPlaybackOffsetTicks)
@@ -572,17 +580,18 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // Session is ready.
                 context.SetBuffering(session, false);
 
-                var latencyThresholdTicks = context.GetHighestPing() * 2 * TimeSpan.TicksPerMillisecond;
-                if (!wasCorrected && delayTicks > latencyThresholdTicks)
+                if (!wasCorrected && request.IsPlaying && delayTicks > 0)
                 {
                     // The session is behind but still playing: it is recovering from the buffer,
-                    // not lost. Remember when it is expected to reach the group position.
+                    // not lost. Remember when it is expected to reach the group position. This is
+                    // independent of the transport allowance: a short recovery still needs its
+                    // stop even when the latency is larger than the remaining distance.
                     context.StartRecovery(session, currentTime.AddTicks(delayTicks));
                 }
                 else
                 {
-                    // The session is at the group position, or was already corrected: any
-                    // previous recovery for it is complete and must stop delaying the group.
+                    // The session is at the group position, is paused, or was already corrected:
+                    // any previous recovery for it is complete and must stop delaying the group.
                     context.RetireRecovery(session);
                 }
 

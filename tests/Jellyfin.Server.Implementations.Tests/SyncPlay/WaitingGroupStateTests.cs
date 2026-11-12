@@ -1755,23 +1755,45 @@ public class WaitingGroupStateTests
             .Where(delivery => delivery.SessionId == harness.First.Id)
             .ToList();
         Assert.Equal(SendCommandType.Unpause, relevant[^1].Command.Command);
+
+        // Advancing the sweep past the former recovery window must not add playback actions.
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow.AddSeconds(10));
+        Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
+        Assert.Empty(harness.CommandsTo(harness.First.Id, SendCommandType.Pause));
     }
 
     [Fact]
-    public void ShortRemainingRecovery_StopsAtThePositionAndResumesAfterTheLatencyAllowance()
+    public void ShortRemainingRecovery_UnderHigherPing_StopsAtThePositionAndResumesAfterTheAllowance()
     {
-        var scenario = StartCatchUpRecovery();
-        var harness = scenario.Harness;
+        var harness = new GroupHarness();
         var group = harness.Group;
 
-        // The first member buffers and recovers again with a much shorter remaining recovery.
-        group.HandleRequest(
-            harness.Second,
-            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, false, scenario.PlaylistItemId),
-            CancellationToken.None);
+        group.UpdatePing(harness.First, 1200);
+        group.UpdatePing(harness.Second, 1200);
+
+        var position = TimeSpan.FromMinutes(10).Ticks;
         group.HandleRequest(
             harness.First,
-            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, true, scenario.PlaylistItemId),
+            new PlayGroupRequest(new[] { Guid.NewGuid() }, 0, position),
+            CancellationToken.None);
+        var playlistItemId = group.PlayQueue.GetPlayingItemPlaylistId();
+        group.HandleRequest(
+            harness.First,
+            new ReadyGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+
+        // Both members buffer; the first comes back with only 300 ms of recovery left.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
             CancellationToken.None);
 
         harness.Commands.Clear();
@@ -1780,34 +1802,37 @@ public class WaitingGroupStateTests
         var readyTime = DateTime.UtcNow;
         group.HandleRequest(
             harness.First,
-            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks - TimeSpan.FromMilliseconds(300).Ticks, true, scenario.PlaylistItemId),
+            new ReadyGroupRequest(DateTime.UtcNow, position - TimeSpan.FromMilliseconds(300).Ticks, true, playlistItemId),
             CancellationToken.None);
 
         Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
-
-        var pause = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Pause));
-        Assert.InRange(pause.When, readyTime.AddMilliseconds(100), readyTime.AddMilliseconds(500));
+        var stop = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Pause));
+        Assert.InRange(stop.When, readyTime.AddMilliseconds(100), readyTime.AddMilliseconds(500));
 
         harness.Commands.Clear();
         harness.DeliveredCommands.Clear();
 
-        // The other member is ready: the group starts after the latency allowance, not before the
-        // member has stopped at the position.
+        // The other member is ready at the position. The group start is set by the 2.4 s latency
+        // allowance, but the short recovery still needs to stop at the target and wait there.
         group.HandleRequest(
             harness.Second,
-            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks, false, scenario.PlaylistItemId),
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
             CancellationToken.None);
 
         Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+        Assert.InRange(groupStart - readyTime, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3.5));
 
-        // The recovering member is deferred until it has stopped, so it is not part of the resume.
+        var last = harness.DeliveredCommands.Where(delivery => delivery.SessionId == harness.First.Id).Last().Command;
+        Assert.Equal(SendCommandType.Pause, last.Command);
+        Assert.InRange(last.When, stop.When.AddMilliseconds(-100), stop.When.AddMilliseconds(100));
         Assert.Empty(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
 
-        harness.PumpScheduledRecoveryResumes(pause.When.AddMilliseconds(50));
+        harness.PumpScheduledRecoveryResumes(last.When.AddMilliseconds(50));
 
-        var unpause = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
-        Assert.InRange(unpause.When, readyTime.AddMilliseconds(400), readyTime.AddMilliseconds(1000));
-        Assert.Equal(group.PositionTicks, unpause.PositionTicks);
+        var resume = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
+        Assert.InRange(resume.When, groupStart.AddMilliseconds(-100), groupStart.AddMilliseconds(100));
+        Assert.Equal(group.PositionTicks, resume.PositionTicks);
     }
 
     [Fact]
@@ -1892,6 +1917,440 @@ public class WaitingGroupStateTests
         // The preserved recovery still defines the start.
         var unpause = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
         Assert.InRange(unpause.When, scenario.Deadline.AddMilliseconds(-100), scenario.Deadline.AddMilliseconds(100));
+    }
+
+    [Fact]
+    public void PauseWhileWaiting_SupersedesTheFutureRecoveryStopImmediately()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        // Another member buffers, scheduling a stop for the recovering member at its deadline.
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, false, scenario.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(harness.CommandsTo(harness.First.Id, SendCommandType.Pause)[^1].When > DateTime.UtcNow.AddSeconds(3));
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The user pauses while the other member is still buffering.
+        group.HandleRequest(harness.Second, new PauseGroupRequest(), CancellationToken.None);
+
+        // The recovering member must be stopped now, not left playing until its obsolete deadline.
+        Assert.Contains(
+            harness.CommandsTo(harness.First.Id, SendCommandType.Pause),
+            pause => pause.When <= DateTime.UtcNow.AddMilliseconds(300));
+
+        // Background delivery must not unpause against the user's intent.
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow.AddSeconds(10));
+        Assert.DoesNotContain(harness.DeliveredCommands, delivery => delivery.Command.Command == SendCommandType.Unpause);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PlayingStateResynchronization_PreservesThePendingRecoveryStop(bool unpauseRequest)
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, true, scenario.PlaylistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks - TimeSpan.FromSeconds(1).Ticks, true, scenario.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+
+        // The shorter recovery's pending command is its stop, not the group start.
+        var lastBefore = harness.DeliveredCommands.Where(delivery => delivery.SessionId == harness.Second.Id).Last().Command;
+        Assert.Equal(SendCommandType.Pause, lastBefore.Command);
+        Assert.True(lastBefore.When < groupStart);
+
+        // Clients keep one scheduled playback command, so a state-resynchronization request must
+        // not replace the one-second stop with a five-second unpause.
+        if (unpauseRequest)
+        {
+            group.HandleRequest(harness.Second, new UnpauseGroupRequest(), CancellationToken.None);
+        }
+        else
+        {
+            group.HandleRequest(
+                harness.Second,
+                new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks - TimeSpan.FromSeconds(1).Ticks, true, scenario.PlaylistItemId),
+                CancellationToken.None);
+        }
+
+        var lastAfter = harness.DeliveredCommands.Where(delivery => delivery.SessionId == harness.Second.Id).Last().Command;
+        Assert.Equal(SendCommandType.Pause, lastAfter.Command);
+        Assert.InRange(lastAfter.When, lastBefore.When.AddMilliseconds(-100), lastBefore.When.AddMilliseconds(100));
+
+        // A sweep before the stop is due must not deliver anything.
+        harness.PumpScheduledRecoveryResumes(lastAfter.When.AddMilliseconds(-100));
+        Assert.Empty(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+
+        // The stop is still followed by the group start it was preparing for.
+        harness.PumpScheduledRecoveryResumes(lastAfter.When.AddMilliseconds(50));
+
+        var resume = harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause)[^1];
+        Assert.InRange(resume.When, groupStart.AddMilliseconds(-100), groupStart.AddMilliseconds(100));
+        Assert.Equal(group.PositionTicks, resume.PositionTicks);
+    }
+
+    [Fact]
+    public void ShortRecovery_UnderHigherPing_StillStopsBeforeALongerRecovery()
+    {
+        var harness = new GroupHarness();
+        var group = harness.Group;
+
+        group.UpdatePing(harness.First, 1200);
+        group.UpdatePing(harness.Second, 1200);
+
+        var position = TimeSpan.FromMinutes(10).Ticks;
+        group.HandleRequest(
+            harness.First,
+            new PlayGroupRequest(new[] { Guid.NewGuid() }, 0, position),
+            CancellationToken.None);
+        var playlistItemId = group.PlayQueue.GetPlayingItemPlaylistId();
+        group.HandleRequest(
+            harness.First,
+            new ReadyGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+
+        // Both members buffer; the first comes back with a one-second recovery that is shorter
+        // than the 2.4-second transport allowance implied by the pings.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        group.HandleRequest(
+            harness.First,
+            new ReadyGroupRequest(DateTime.UtcNow, position - TimeSpan.FromSeconds(1).Ticks, true, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        var stop = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Pause));
+
+        // The other member needs five seconds, which sets the group start.
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position - TimeSpan.FromSeconds(5).Ticks, true, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+
+        // The shorter recovery still needs to stop at the target before the longer one ends.
+        var last = harness.DeliveredCommands.Where(delivery => delivery.SessionId == harness.First.Id).Last().Command;
+        Assert.Equal(SendCommandType.Pause, last.Command);
+        Assert.InRange(last.When, stop.When.AddMilliseconds(-100), stop.When.AddMilliseconds(100));
+
+        // It waits at the target and then resumes with the later group start.
+        harness.PumpScheduledRecoveryResumes(last.When.AddMilliseconds(50));
+
+        var resume = harness.CommandsTo(harness.First.Id, SendCommandType.Unpause)[^1];
+        Assert.InRange(resume.When, groupStart.AddMilliseconds(-100), groupStart.AddMilliseconds(100));
+    }
+
+    [Fact]
+    public async Task PausedBufferReportAtTheRecoveryStop_DoesNotRestartTheWait()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        var stop = StartShortRecovery(scenario);
+        var groupStart = group.LastActivity;
+        Assert.Empty(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+
+        // Let the planned stop take effect but keep the group start in the future.
+        await Task.Delay(450, TestContext.Current.CancellationToken);
+        Assert.True(stop.When < DateTime.UtcNow);
+        Assert.True(groupStart > DateTime.UtcNow);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The stop's seek makes the paused player report buffering at the target. That report is
+        // part of the planned stop, not a new loading stall.
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, false, scenario.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.False(group.IsBuffering());
+
+        // The valid start plan remains in force and resumes the member without another Ready.
+        Assert.Empty(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow);
+
+        var resume = Assert.Single(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+        Assert.InRange(resume.When, groupStart.AddMilliseconds(-100), groupStart.AddMilliseconds(100));
+    }
+
+    [Fact]
+    public async Task NaturalRecoveryExpiry_KeepsTheDeferredResume()
+    {
+        var scenario = StartCatchUpRecovery(extraMembers: 1);
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        var stop = StartShortRecovery(scenario);
+        var groupStart = group.LastActivity;
+        Assert.Empty(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+
+        // The short recovery naturally completes before the sweep owes it a resume.
+        await Task.Delay(450, TestContext.Current.CancellationToken);
+        Assert.True(stop.When < DateTime.UtcNow);
+        Assert.True(groupStart > DateTime.UtcNow);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // An unrelated member leaving must not delete the pending resume.
+        group.SessionLeave(scenario.Extras[0], new LeaveGroupRequest(), CancellationToken.None);
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow);
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow.AddSeconds(10));
+
+        var resume = Assert.Single(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+        Assert.InRange(resume.When, groupStart.AddMilliseconds(-100), groupStart.AddMilliseconds(100));
+    }
+
+    [Fact]
+    public void PausedBufferBehindTheRecoveryTarget_StillStartsTheWait()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        StartShortRecovery(scenario);
+
+        // The member is paused but has not reached the target: it is genuinely still loading.
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks - TimeSpan.FromSeconds(2).Ticks, false, scenario.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering());
+    }
+
+    [Fact]
+    public void BufferingWhilePlayingAtTheRecoveryTarget_StillStartsTheWait()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        StartShortRecovery(scenario);
+
+        // A playing member that reports buffering at the target is loading again.
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, true, scenario.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering());
+    }
+
+    [Fact]
+    public void BufferingAtTheRecoveryTargetForAStaleItem_IsNotAccepted()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        StartShortRecovery(scenario);
+
+        // A stale playlist item is not the planned stop's item: normal validation applies.
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, false, harness.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering());
+    }
+
+    [Fact]
+    public async Task StateResynchronizationAfterTheStop_DeliversTheOwedResumeOncePerPlan()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        StartShortRecovery(scenario);
+        var groupStart = group.LastActivity;
+
+        await Task.Delay(450, TestContext.Current.CancellationToken);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The member has stopped and asks for the current state before the sweep fires.
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks, true, scenario.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var resumed = harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause);
+        Assert.NotEmpty(resumed);
+        Assert.All(resumed, command => Assert.InRange(command.When, groupStart.AddMilliseconds(-100), groupStart.AddMilliseconds(100)));
+
+        // A later (or repeated) sweep must not change the effective plan or issue seeks.
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow);
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow.AddSeconds(10));
+
+        Assert.Empty(harness.CommandsTo(harness.Second.Id, SendCommandType.Seek));
+        Assert.All(
+            harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause),
+            command => Assert.InRange(command.When, groupStart.AddMilliseconds(-100), groupStart.AddMilliseconds(100)));
+    }
+
+    [Fact]
+    public async Task RecoveringMemberLeavesAfterItsStop_RetiresItsDeferredResume()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        StartShortRecovery(scenario);
+
+        await Task.Delay(450, TestContext.Current.CancellationToken);
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        var scheduledStart = group.LastActivity;
+        group.SessionLeave(harness.Second, new LeaveGroupRequest(), CancellationToken.None);
+
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow);
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow.AddSeconds(10));
+
+        Assert.Empty(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.Equal(scheduledStart, group.LastActivity);
+    }
+
+    [Fact]
+    public async Task RecoveringMemberIgnoresWaitAfterItsStop_RetiresItsDeferredResume()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        StartShortRecovery(scenario);
+
+        await Task.Delay(450, TestContext.Current.CancellationToken);
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        group.HandleRequest(harness.Second, new IgnoreWaitGroupRequest(true), CancellationToken.None);
+
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow);
+        Assert.Empty(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+    }
+
+    [Fact]
+    public void PauseDuringAScheduledResume_CancelsTheDeferredResume()
+    {
+        var scenario = StartCatchUpRecovery();
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        // The shorter recovery is deferred to the longer one's start.
+        StartShortRecovery(scenario);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        group.HandleRequest(harness.First, new PauseGroupRequest(), CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Paused, group.GetInfo().State);
+
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow.AddSeconds(10));
+
+        Assert.DoesNotContain(harness.DeliveredCommands, delivery => delivery.Command.Command == SendCommandType.Unpause);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UnrelatedMembershipChangeBeforeTheShortStop_KeepsTheDeferredResume(bool ignoreWait)
+    {
+        var scenario = StartCatchUpRecovery(extraMembers: 1);
+        var harness = scenario.Harness;
+        var group = harness.Group;
+        var third = scenario.Extras[0];
+
+        var stop = StartShortRecovery(scenario);
+        var groupStart = group.LastActivity;
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // A third member changes its relationship with the group before the short stop is due.
+        if (ignoreWait)
+        {
+            group.HandleRequest(third, new IgnoreWaitGroupRequest(true), CancellationToken.None);
+        }
+        else
+        {
+            group.SessionLeave(third, new LeaveGroupRequest(), CancellationToken.None);
+        }
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+
+        harness.PumpScheduledRecoveryResumes(stop.When.AddMilliseconds(50));
+
+        var resume = Assert.Single(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+        Assert.InRange(resume.When, groupStart.AddMilliseconds(-100), groupStart.AddMilliseconds(100));
+    }
+
+    private static SendCommand StartShortRecovery(CatchUpScenario scenario)
+    {
+        var harness = scenario.Harness;
+        var group = harness.Group;
+
+        // A second member buffers and comes back 300 ms behind the frozen group position.
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, group.PositionTicks, true, scenario.PlaylistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, group.PositionTicks - TimeSpan.FromMilliseconds(300).Ticks, true, scenario.PlaylistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        return harness.CommandsTo(harness.Second.Id, SendCommandType.Pause)[^1];
     }
 
     private sealed class GroupHarness
