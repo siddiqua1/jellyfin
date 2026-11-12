@@ -141,6 +141,19 @@ client-side network inspector showing `SyncPlayCommand` messages with `Command`,
 3. Expected: the group start and the short member's deferred resume are unchanged. Repeating the
    sweep must not deliver a different plan or seek the member.
 
+## Scenario L: resume delivered before the pause-induced report
+
+1. Set up overlapping recoveries where a short recovery stops at the target before the group
+   start, and let the periodic sweep deliver that member's future resume before the player's
+   pause-induced buffering report reaches the server.
+2. Also repeat the run with a recovery that completes while the group is still waiting for a
+   different member, and with a membership change or a replanned start between the stop and the
+   report.
+3. Expected: the group stays Playing with the same start time, the reporting member is not a new
+   blocking loader, and no timeout wait appears. A report more than the accepted position
+   tolerance away from the target, after the scheduled start, with a stale item, or without a
+   matching recovery stop must still follow normal buffering handling.
+
 ## Recorded outcomes
 
 No multi-client run has been recorded yet. Mark each scenario passed only after observing the

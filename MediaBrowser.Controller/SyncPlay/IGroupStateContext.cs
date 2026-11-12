@@ -89,9 +89,10 @@ namespace MediaBrowser.Controller.SyncPlay
         void RetireRecoveries();
 
         /// <summary>
-        /// Cancels the resume commands that were deferred for recoveries finishing before the group start.
+        /// Cancels the resumes deferred for the current plan. Recognition of stops that already
+        /// happened is kept so that the next match can be recomputed against the new start.
         /// </summary>
-        void ClearRecoveryResumes();
+        void ClearRecoveryPlan();
 
         /// <summary>
         /// Gets whether a position reported by a session belongs to the planned recovery stop it

@@ -98,7 +98,7 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             // The resume planned before the join is superseded by the wait for the joiner, but a
             // recovery that still describes the frozen position stays valid.
-            context.ClearRecoveryResumes();
+            context.ClearRecoveryPlan();
             context.ScheduleRecoveryStops(DateTime.UtcNow, cancellationToken);
 
             // Send pause command to all non-buffering sessions that are not recovering.
@@ -430,7 +430,7 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 // The resume planned for the previous state is obsolete now that the group is
                 // waiting again. The commands sent below replace the ones clients have scheduled.
-                context.ClearRecoveryResumes();
+                context.ClearRecoveryPlan();
 
                 // A recovering session is still playing towards the frozen group position.
                 // Pausing it right away would seek it forward and skip content, so keep it
