@@ -68,6 +68,16 @@ namespace Emby.Server.Implementations.SyncPlay
         private readonly Dictionary<string, SessionInfo> _participantSessions = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
+        /// The sessions that are catching up to the group position, keyed by session identifier.
+        /// </summary>
+        private readonly Dictionary<string, PlaybackRecovery> _recoveries = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// The resume commands deferred until a recovering session reaches the group position.
+        /// </summary>
+        private readonly Dictionary<string, ScheduledRecoveryResume> _scheduledRecoveryResumes = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
         /// The internal group state.
         /// </summary>
         private IGroupState _state;
@@ -173,15 +183,158 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <value>The last activity.</value>
         public DateTime LastActivity { get; set; }
 
-        /// <summary>
-        /// Gets or sets the identifier of the session catching up to the group position, if any.
-        /// </summary>
-        public string CatchUpSessionId { get; set; }
+        /// <inheritdoc />
+        public void StartRecovery(SessionInfo session, DateTime expectedCompletion)
+        {
+            // A session that opted out of the group wait must not define when the group resumes,
+            // even while it recovers from a buffer of its own.
+            if (!_participants.TryGetValue(session.Id, out var member) || member.IgnoreGroupWait)
+            {
+                RemoveRecovery(session.Id);
+                return;
+            }
 
-        /// <summary>
-        /// Gets or sets the UTC time at which the catching-up session reaches the group position.
-        /// </summary>
-        public DateTime? CatchUpUntil { get; set; }
+            if (expectedCompletion <= DateTime.UtcNow)
+            {
+                RemoveRecovery(session.Id);
+                return;
+            }
+
+            _recoveries[session.Id] = new PlaybackRecovery(
+                session.Id,
+                PlayQueue.GetPlayingItemPlaylistId(),
+                PositionTicks,
+                expectedCompletion);
+
+            // A new deadline supersedes the resume deferred for the previous one.
+            _scheduledRecoveryResumes.Remove(session.Id);
+        }
+
+        /// <inheritdoc />
+        public void RetireRecovery(SessionInfo session)
+        {
+            if (session is not null)
+            {
+                RemoveRecovery(session.Id);
+            }
+        }
+
+        /// <inheritdoc />
+        public void RetireRecoveries()
+        {
+            _recoveries.Clear();
+            _scheduledRecoveryResumes.Clear();
+        }
+
+        /// <inheritdoc />
+        public void ClearRecoveryResumes()
+        {
+            _scheduledRecoveryResumes.Clear();
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyList<PlaybackRecovery> GetActiveRecoveries(DateTime currentTime)
+        {
+            PruneRecoveries(currentTime);
+            return _recoveries.Values.ToList();
+        }
+
+        /// <inheritdoc />
+        public void ScheduleRecoveryStops(DateTime currentTime, CancellationToken cancellationToken)
+        {
+            foreach (var recovery in GetActiveRecoveries(currentTime))
+            {
+                // Keep the session playing towards the frozen group position, but stop it there.
+                var command = NewSyncPlayCommand(SendCommandType.Pause);
+                command.When = recovery.ExpectedCompletion;
+                SendCommandToSession(recovery.SessionId, command, cancellationToken);
+            }
+        }
+
+        /// <inheritdoc />
+        public DateTime GetGroupResumeTime(DateTime currentTime)
+        {
+            var latencyMillis = Math.Max(GetHighestPing() * 2, DefaultPing);
+            var resumeAt = currentTime.AddMilliseconds(latencyMillis);
+
+            foreach (var recovery in GetActiveRecoveries(currentTime))
+            {
+                if (recovery.ExpectedCompletion > resumeAt)
+                {
+                    resumeAt = recovery.ExpectedCompletion;
+                }
+            }
+
+            return resumeAt;
+        }
+
+        /// <inheritdoc />
+        public DateTime StartGroupPlayback(SessionInfo from, CancellationToken cancellationToken)
+        {
+            var resumeAt = GetGroupResumeTime(DateTime.UtcNow);
+
+            // Sessions that finish recovering before the group starts stop at the group position
+            // and are resumed when the group does, so a shorter recovery never runs past a
+            // longer one.
+            var deferred = PrepareGroupResume(resumeAt, cancellationToken);
+
+            LastActivity = resumeAt;
+
+            var command = NewSyncPlayCommand(SendCommandType.Unpause);
+            SendCommand(from, SyncPlayBroadcastType.AllGroup, command, deferred, cancellationToken);
+
+            return resumeAt;
+        }
+
+        /// <inheritdoc />
+        public void RefreshScheduledStart(SessionInfo from, CancellationToken cancellationToken)
+        {
+            var currentTime = DateTime.UtcNow;
+            if (LastActivity <= currentTime)
+            {
+                // Playback already started; there is no scheduled start to recompute.
+                return;
+            }
+
+            if (GetGroupResumeTime(currentTime) >= LastActivity)
+            {
+                // The scheduled start is unchanged by the recovery that went away.
+                return;
+            }
+
+            StartGroupPlayback(from, cancellationToken);
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyCollection<string> PrepareGroupResume(DateTime resumeAt, CancellationToken cancellationToken)
+        {
+            ClearRecoveryResumes();
+
+            // Clients keep only the most recently received playback command: a command sent now
+            // replaces whatever was scheduled before, independently of its When value. The
+            // commands below therefore supersede the resume that was planned earlier.
+            var deferred = new List<string>();
+            foreach (var recovery in GetActiveRecoveries(DateTime.UtcNow))
+            {
+                if (recovery.ExpectedCompletion >= resumeAt)
+                {
+                    // This session reaches the group position when the group starts; the resume
+                    // command itself replaces any pause that was scheduled for it.
+                    continue;
+                }
+
+                // The session reaches the group position before the group starts: make sure it
+                // stops there, and resume it once it has actually arrived.
+                var command = NewSyncPlayCommand(SendCommandType.Pause);
+                command.When = recovery.ExpectedCompletion;
+                SendCommandToSession(recovery.SessionId, command, cancellationToken);
+
+                _scheduledRecoveryResumes[recovery.SessionId] = new ScheduledRecoveryResume(recovery.ExpectedCompletion, resumeAt);
+                deferred.Add(recovery.SessionId);
+            }
+
+            return deferred;
+        }
 
         /// <summary>
         /// Adds the session to the group.
@@ -208,7 +361,71 @@ namespace Emby.Server.Implementations.SyncPlay
         {
             _participants.Remove(session.Id);
             _participantSessions.Remove(session.Id);
+            RemoveRecovery(session.Id);
             UpdateGroupWaitDeadline(false);
+        }
+
+        /// <summary>
+        /// Removes the recovery of a session, if any.
+        /// </summary>
+        /// <param name="sessionId">The session identifier.</param>
+        private void RemoveRecovery(string sessionId)
+        {
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                return;
+            }
+
+            _recoveries.Remove(sessionId);
+            _scheduledRecoveryResumes.Remove(sessionId);
+        }
+
+        /// <summary>
+        /// Discards the recoveries that no longer describe the current playback timeline.
+        /// </summary>
+        /// <param name="currentTime">The current UTC time.</param>
+        private void PruneRecoveries(DateTime currentTime)
+        {
+            if (_recoveries.Count == 0)
+            {
+                return;
+            }
+
+            var playingItemId = PlayQueue.GetPlayingItemPlaylistId();
+            List<string> stale = null;
+            foreach (var (sessionId, recovery) in _recoveries)
+            {
+                if (recovery.ExpectedCompletion <= currentTime
+                    || !recovery.PlaylistItemId.Equals(playingItemId)
+                    || recovery.TargetPositionTicks != PositionTicks
+                    || !_participants.ContainsKey(sessionId))
+                {
+                    (stale ??= new()).Add(sessionId);
+                }
+            }
+
+            if (stale is null)
+            {
+                return;
+            }
+
+            foreach (var sessionId in stale)
+            {
+                RemoveRecovery(sessionId);
+            }
+        }
+
+        /// <summary>
+        /// Checks whether a session is still expected to reach the group position.
+        /// </summary>
+        /// <param name="sessionId">The session identifier.</param>
+        /// <returns><c>true</c> if the session is recovering; <c>false</c> otherwise.</returns>
+        private bool IsRecovering(string sessionId)
+        {
+            return _recoveries.TryGetValue(sessionId, out var recovery)
+                && recovery.ExpectedCompletion > DateTime.UtcNow
+                && recovery.PlaylistItemId.Equals(PlayQueue.GetPlayingItemPlaylistId())
+                && recovery.TargetPositionTicks == PositionTicks;
         }
 
         /// <summary>
@@ -235,7 +452,7 @@ namespace Emby.Server.Implementations.SyncPlay
                     .Select(member => member.SessionId),
                 SyncPlayBroadcastType.AllReadyExceptCatchUp => _participants
                     .Values
-                    .Where(member => !member.IsBuffering && !string.Equals(member.SessionId, CatchUpSessionId, StringComparison.OrdinalIgnoreCase))
+                    .Where(member => !member.IsBuffering && !IsRecovering(member.SessionId))
                     .Select(member => member.SessionId),
                 _ => Enumerable.Empty<string>()
             };
@@ -343,6 +560,9 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <param name="cancellationToken">The cancellation token.</param>
         public void SessionJoin(SessionInfo session, JoinGroupRequest request, CancellationToken cancellationToken)
         {
+            // The join supersedes the resume planned for the previous members; recoveries that
+            // still describe the frozen position are kept by the waiting state.
+            ClearRecoveryResumes();
             AddSession(session);
 
             var updateSession = new SyncPlayGroupJoinedUpdate(GroupId, GetInfo());
@@ -364,6 +584,10 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <param name="cancellationToken">The cancellation token.</param>
         public void SessionLeave(SessionInfo session, LeaveGroupRequest request, CancellationToken cancellationToken)
         {
+            // The leaving session must not hold the group to a recovery deadline, not even while
+            // the state decides whether the remaining members can resume.
+            RetireRecovery(session);
+
             _state.SessionLeaving(this, _state.Type, session, cancellationToken);
 
             RemoveSession(session);
@@ -390,6 +614,13 @@ namespace Emby.Server.Implementations.SyncPlay
             // happens client side. Clients are aware of the server's time and use it to sync.
             _logger.LogInformation("Session {SessionId} requested {RequestType} in group {GroupId} that is {StateType}.", session.Id, request.Action, GroupId.ToString(), _state.Type);
 
+            // Explicit playback controls and timeline changes supersede a recovery that was
+            // planned around the previous timeline, whatever the current group state is.
+            if (SupersedesRecoveries(request))
+            {
+                RetireRecoveries();
+            }
+
             // Apply requested changes to this group given its current state.
             // Every request has a slightly different outcome depending on the group's state.
             // There are currently four different group states that accomplish different goals:
@@ -400,6 +631,25 @@ namespace Emby.Server.Implementations.SyncPlay
             // - Playing: clients have some media loaded and playback is unpaused.
             // - Paused: clients have some media loaded but playback is currently paused.
             request.Apply(this, _state, session, cancellationToken);
+        }
+
+        /// <summary>
+        /// Checks whether a request makes the recovery plan obsolete.
+        /// </summary>
+        /// <param name="request">The request.</param>
+        /// <returns><c>true</c> if the recoveries must be retired; <c>false</c> otherwise.</returns>
+        private bool SupersedesRecoveries(IGroupPlaybackRequest request)
+        {
+            return request switch
+            {
+                PauseGroupRequest => true,
+                StopGroupRequest => true,
+                SeekGroupRequest => true,
+                // An unpause while the group is already playing is a client that lost the state:
+                // it does not change the group's plan.
+                UnpauseGroupRequest => !_state.Type.Equals(GroupStateType.Playing),
+                _ => false
+            };
         }
 
         /// <summary>
@@ -431,6 +681,13 @@ namespace Emby.Server.Implementations.SyncPlay
                 value.IgnoreGroupWait = ignoreGroupWait;
             }
 
+            if (ignoreGroupWait)
+            {
+                // The session stopped following group playback: its recovery no longer defines
+                // when the group may resume.
+                RetireRecovery(session);
+            }
+
             UpdateGroupWaitDeadline(false);
         }
 
@@ -443,6 +700,12 @@ namespace Emby.Server.Implementations.SyncPlay
             if (state.Type != GroupStateType.Waiting)
             {
                 GroupWaitDeadline = null;
+            }
+
+            // A paused or stopped group has no pending playback to recover into.
+            if (state.Type.Equals(GroupStateType.Paused) || state.Type.Equals(GroupStateType.Idle))
+            {
+                RetireRecoveries();
             }
         }
 
@@ -463,15 +726,42 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <inheritdoc />
         public Task SendCommand(SessionInfo from, SyncPlayBroadcastType type, SendCommand message, CancellationToken cancellationToken)
         {
-            IEnumerable<Task> GetTasks()
+            return SendCommandToSessions(FilterSessions(from.Id, type), message, cancellationToken);
+        }
+
+        /// <inheritdoc />
+        public Task SendCommand(SessionInfo from, SyncPlayBroadcastType type, SendCommand message, IReadOnlyCollection<string> excludedSessionIds, CancellationToken cancellationToken)
+        {
+            var sessionIds = FilterSessions(from.Id, type);
+            if (excludedSessionIds is not null)
             {
-                foreach (var sessionId in FilterSessions(from.Id, type))
-                {
-                    yield return _sessionManager.SendSyncPlayCommand(sessionId, message, cancellationToken);
-                }
+                sessionIds = sessionIds.Where(sessionId => !excludedSessionIds.Contains(sessionId, StringComparer.OrdinalIgnoreCase));
             }
 
-            return Task.WhenAll(GetTasks());
+            return SendCommandToSessions(sessionIds, message, cancellationToken);
+        }
+
+        /// <inheritdoc />
+        public Task SendCommandToSession(string sessionId, SendCommand message, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrEmpty(sessionId) || !_participants.ContainsKey(sessionId))
+            {
+                return Task.CompletedTask;
+            }
+
+            return _sessionManager.SendSyncPlayCommand(sessionId, message, cancellationToken);
+        }
+
+        /// <summary>
+        /// Sends a playback command to a set of sessions.
+        /// </summary>
+        /// <param name="sessionIds">The recipients.</param>
+        /// <param name="message">The message to send.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The task.</returns>
+        private Task SendCommandToSessions(IEnumerable<string> sessionIds, SendCommand message, CancellationToken cancellationToken)
+        {
+            return Task.WhenAll(sessionIds.Select(sessionId => _sessionManager.SendSyncPlayCommand(sessionId, message, cancellationToken)));
         }
 
         /// <inheritdoc />
@@ -575,6 +865,7 @@ namespace Emby.Server.Implementations.SyncPlay
             RunTimeTicks = item.RunTimeTicks ?? 0;
             PositionTicks = startPositionTicks;
             LastActivity = DateTime.UtcNow;
+            RetireRecoveries();
 
             return true;
         }
@@ -670,6 +961,7 @@ namespace Emby.Server.Implementations.SyncPlay
         {
             PositionTicks = 0;
             LastActivity = DateTime.UtcNow;
+            RetireRecoveries();
         }
 
         /// <inheritdoc />
@@ -822,6 +1114,86 @@ namespace Emby.Server.Implementations.SyncPlay
             {
                 GroupWaitDeadline = Environment.TickCount64 + GroupWaitTimeout;
             }
+        }
+
+        /// <summary>
+        /// Resumes the sessions whose recovery finished before the group start, once their stop at
+        /// the group position has taken effect. Called by the periodic sweep.
+        /// </summary>
+        /// <param name="utcNow">The current UTC time.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        internal void HandleScheduledRecoveryResumes(DateTime utcNow, CancellationToken cancellationToken)
+        {
+            if (_scheduledRecoveryResumes.Count == 0)
+            {
+                return;
+            }
+
+            List<KeyValuePair<string, ScheduledRecoveryResume>> due = null;
+            foreach (var entry in _scheduledRecoveryResumes)
+            {
+                if (entry.Value.PauseAt <= utcNow)
+                {
+                    (due ??= new()).Add(entry);
+                }
+            }
+
+            if (due is null)
+            {
+                return;
+            }
+
+            foreach (var (sessionId, scheduled) in due)
+            {
+                _scheduledRecoveryResumes.Remove(sessionId);
+
+                if (!_participants.ContainsKey(sessionId))
+                {
+                    continue;
+                }
+
+                // The pause scheduled at the recovery deadline has already taken effect on the
+                // client; schedule its resume without replacing that pause beforehand. Clients
+                // keep only the latest command, so this Unpause is the one that will fire.
+                var command = NewSyncPlayCommand(SendCommandType.Unpause);
+                command.When = scheduled.ResumeAt;
+                SendCommandToSession(sessionId, command, cancellationToken);
+
+                _logger.LogInformation(
+                    "Session {SessionId} finished recovering before group {GroupId} resumed; scheduling its resume in {Delay} seconds.",
+                    sessionId,
+                    GroupId.ToString(),
+                    (scheduled.ResumeAt - utcNow).TotalSeconds);
+            }
+        }
+
+        /// <summary>
+        /// A resume scheduled for a session that stops at the group position before the group starts.
+        /// </summary>
+        private sealed class ScheduledRecoveryResume
+        {
+            /// <summary>
+            /// Initializes a new instance of the <see cref="ScheduledRecoveryResume"/> class.
+            /// </summary>
+            /// <param name="pauseAt">When the session is expected to reach the group position.</param>
+            /// <param name="resumeAt">When the group is expected to resume playback.</param>
+            public ScheduledRecoveryResume(DateTime pauseAt, DateTime resumeAt)
+            {
+                PauseAt = pauseAt;
+                ResumeAt = resumeAt;
+            }
+
+            /// <summary>
+            /// Gets the time at which the session stops at the group position.
+            /// </summary>
+            /// <value>The pause time.</value>
+            public DateTime PauseAt { get; }
+
+            /// <summary>
+            /// Gets the time at which the session resumes with the group.
+            /// </summary>
+            /// <value>The resume time.</value>
+            public DateTime ResumeAt { get; }
         }
     }
 }

@@ -442,6 +442,7 @@ namespace Emby.Server.Implementations.SyncPlay
                         lock (group)
                         {
                             group.HandleGroupWaitTimeout(CancellationToken.None);
+                            group.HandleScheduledRecoveryResumes(DateTime.UtcNow, CancellationToken.None);
                         }
                     }
                 }

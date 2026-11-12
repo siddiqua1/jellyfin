@@ -58,20 +58,86 @@ namespace MediaBrowser.Controller.SyncPlay
         DateTime LastActivity { get; set; }
 
         /// <summary>
-        /// Gets or sets the identifier of the session that is catching up to the group position, if any.
-        /// </summary>
-        string CatchUpSessionId { get; set; }
-
-        /// <summary>
-        /// Gets or sets the UTC time at which the catching-up session is expected to reach the group position.
-        /// </summary>
-        DateTime? CatchUpUntil { get; set; }
-
-        /// <summary>
         /// Gets the play queue.
         /// </summary>
         /// <value>The play queue.</value>
         PlayQueueManager PlayQueue { get; }
+
+        /// <summary>
+        /// Records that a session is catching up to the current group position and is expected to
+        /// reach it at the given UTC time.
+        /// </summary>
+        /// <param name="session">The recovering session.</param>
+        /// <param name="expectedCompletion">The UTC time at which the session is expected to reach the group position.</param>
+        void StartRecovery(SessionInfo session, DateTime expectedCompletion);
+
+        /// <summary>
+        /// Retires the recovery of a session, if any.
+        /// </summary>
+        /// <param name="session">The session.</param>
+        void RetireRecovery(SessionInfo session);
+
+        /// <summary>
+        /// Retires every recovery, for instance because its playback timeline is no longer current.
+        /// </summary>
+        void RetireRecoveries();
+
+        /// <summary>
+        /// Cancels the resume commands that were deferred for recoveries finishing before the group start.
+        /// </summary>
+        void ClearRecoveryResumes();
+
+        /// <summary>
+        /// Gets the recoveries that are still expected to complete at the given UTC time.
+        /// Recoveries that belong to a previous playback timeline are discarded.
+        /// </summary>
+        /// <param name="currentTime">The current UTC time.</param>
+        /// <returns>The recoveries that are still in progress.</returns>
+        IReadOnlyList<PlaybackRecovery> GetActiveRecoveries(DateTime currentTime);
+
+        /// <summary>
+        /// Schedules the stop at the group position of every session that is still recovering.
+        /// The sessions keep playing until their recovery deadline and then wait at the frozen
+        /// group position.
+        /// </summary>
+        /// <param name="currentTime">The current UTC time.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        void ScheduleRecoveryStops(DateTime currentTime, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Gets the earliest UTC time at which the group may resume playback: no earlier than the
+        /// latency allowance and every recovery that is still expected to complete.
+        /// </summary>
+        /// <param name="currentTime">The current UTC time.</param>
+        /// <returns>The earliest resume time.</returns>
+        DateTime GetGroupResumeTime(DateTime currentTime);
+
+        /// <summary>
+        /// Starts the group at the earliest allowed time, preserving every recovery that is still
+        /// in progress and deferring the resume of the sessions that stop at the group position
+        /// before the start.
+        /// </summary>
+        /// <param name="from">The session starting the group.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The UTC time at which playback starts.</returns>
+        DateTime StartGroupPlayback(SessionInfo from, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Recomputes a scheduled group start when the recoveries it was waiting for went away.
+        /// Does nothing when playback already started or the start is unchanged.
+        /// </summary>
+        /// <param name="from">The session that caused the change.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        void RefreshScheduledStart(SessionInfo from, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Prepares the commands that let recoveries finishing before the given resume time stop
+        /// at the group position and continue when the group starts.
+        /// </summary>
+        /// <param name="resumeAt">The UTC time at which the group will resume playback.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The sessions whose resume command is deferred until they reach the group position.</returns>
+        IReadOnlyCollection<string> PrepareGroupResume(DateTime resumeAt, CancellationToken cancellationToken);
 
         /// <summary>
         /// Sets a new state.
@@ -99,6 +165,26 @@ namespace MediaBrowser.Controller.SyncPlay
         /// <param name="cancellationToken">The cancellation token.</param>
         /// <returns>The task.</returns>
         Task SendCommand(SessionInfo from, SyncPlayBroadcastType type, SendCommand message, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Sends a playback command to the interested sessions, excluding some of them.
+        /// </summary>
+        /// <param name="from">The current session.</param>
+        /// <param name="type">The filtering type.</param>
+        /// <param name="message">The message to send.</param>
+        /// <param name="excludedSessionIds">The sessions that must not receive the command.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The task.</returns>
+        Task SendCommand(SessionInfo from, SyncPlayBroadcastType type, SendCommand message, IReadOnlyCollection<string> excludedSessionIds, CancellationToken cancellationToken);
+
+        /// <summary>
+        /// Sends a playback command to a single session.
+        /// </summary>
+        /// <param name="sessionId">The session identifier.</param>
+        /// <param name="message">The message to send.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns>The task.</returns>
+        Task SendCommandToSession(string sessionId, SendCommand message, CancellationToken cancellationToken);
 
         /// <summary>
         /// Builds a new playback command with some default values.

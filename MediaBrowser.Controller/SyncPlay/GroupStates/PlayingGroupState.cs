@@ -46,7 +46,17 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void SessionLeaving(IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Do nothing.
+            // A departing session may have been the one the scheduled start was waiting for.
+            context.RefreshScheduledStart(session, cancellationToken);
+        }
+
+        /// <inheritdoc />
+        public override void HandleRequest(IgnoreWaitGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
+        {
+            base.HandleRequest(request, context, prevState, session, cancellationToken);
+
+            // A session that stops following the group no longer defines the scheduled start.
+            context.RefreshScheduledStart(session, cancellationToken);
         }
 
         /// <inheritdoc />
@@ -63,17 +73,11 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         {
             if (!prevState.Equals(Type))
             {
-                // Pick a suitable time that accounts for latency.
-                var delayMillis = Math.Max(context.GetHighestPing() * 2, context.DefaultPing);
-
                 // Unpause group and set starting point in future.
                 // Clients will start playback at LastActivity (datetime) from PositionTicks (playback position).
                 // The added delay does not guarantee, of course, that the command will be received in time.
                 // Playback synchronization will mainly happen client side.
-                context.LastActivity = DateTime.UtcNow.AddMilliseconds(delayMillis);
-
-                var command = context.NewSyncPlayCommand(SendCommandType.Unpause);
-                context.SendCommand(session, SyncPlayBroadcastType.AllGroup, command, cancellationToken);
+                context.StartGroupPlayback(session, cancellationToken);
 
                 // Notify relevant state change event.
                 SendGroupStateUpdate(context, request, session, cancellationToken);

@@ -73,8 +73,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 InitialStateSet = true;
             }
 
-            ClearCatchUp(context);
-
             if (prevState.Equals(GroupStateType.Playing))
             {
                 ResumePlaying = true;
@@ -98,9 +96,14 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             context.SetBuffering(session, true);
 
-            // Send pause command to all non-buffering sessions.
+            // The resume planned before the join is superseded by the wait for the joiner, but a
+            // recovery that still describes the frozen position stays valid.
+            context.ClearRecoveryResumes();
+            context.ScheduleRecoveryStops(DateTime.UtcNow, cancellationToken);
+
+            // Send pause command to all non-buffering sessions that are not recovering.
             var command = context.NewSyncPlayCommand(SendCommandType.Pause);
-            context.SendCommand(session, SyncPlayBroadcastType.AllReady, command, cancellationToken);
+            context.SendCommand(session, SyncPlayBroadcastType.AllReadyExceptCatchUp, command, cancellationToken);
         }
 
         /// <inheritdoc />
@@ -114,11 +117,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             }
 
             context.SetBuffering(session, false);
-
-            if (string.Equals(context.CatchUpSessionId, session.Id, StringComparison.OrdinalIgnoreCase))
-            {
-                ClearCatchUp(context);
-            }
 
             if (!context.IsBuffering())
             {
@@ -154,8 +152,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             }
 
             ResumePlaying = true;
-
-            ClearCatchUp(context);
 
             var setQueueStatus = context.SetPlayQueue(request.PlayingQueue, request.PlayingItemPosition, request.StartPositionTicks);
             PositionJumped = setQueueStatus;
@@ -197,8 +193,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             ResumePlaying = true;
 
-            ClearCatchUp(context);
-
             var result = context.SetPlayingItem(request.PlaylistItemId);
             PositionJumped = result;
             if (result)
@@ -236,8 +230,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 InitialStateSet = true;
             }
 
-            ClearCatchUp(context);
-
             if (prevState.Equals(GroupStateType.Idle))
             {
                 ResumePlaying = true;
@@ -260,6 +252,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     _logger.LogDebug("Forcing the playback to start in group {GroupId}. Group-wait is disabled until next state change.", context.GroupId.ToString());
 
                     // An Unpause request is forcing the playback to start, ignoring sessions that are not ready.
+                    // A user-forced start has already retired the pending recoveries; the group-wait
+                    // timeout reaches this path with them still active, so that the bounded recovery
+                    // of a member that did report ready is not cut short when the group gives up on
+                    // a stalled one.
                     context.SetAllBuffering(false);
 
                     // Change state.
@@ -294,8 +290,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             // Wait for sessions to be ready, then switch to paused state.
             ResumePlaying = false;
 
-            ClearCatchUp(context);
-
             // Notify relevant state change event.
             SendGroupStateUpdate(context, request, session, cancellationToken);
         }
@@ -311,7 +305,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             }
 
             // Change state.
-            ClearCatchUp(context);
             var idleState = new IdleGroupState(LoggerFactory);
             context.SetState(idleState);
             idleState.HandleRequest(request, context, Type, session, cancellationToken);
@@ -337,7 +330,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             }
 
             // Sanitize PositionTicks.
-            ClearCatchUp(context);
             var ticks = context.SanitizePositionTicks(request.PositionTicks);
 
             // Seek.
@@ -370,6 +362,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             {
                 _logger.LogDebug("Session {SessionId} reported wrong playlist item in group {GroupId}.", session.Id, context.GroupId.ToString());
 
+                // The report belongs to a previous playback timeline; a recovery for it cannot
+                // be trusted against the item the group is playing now.
+                context.RetireRecovery(session);
+
                 var playQueueUpdate = context.GetPlayQueueUpdate(PlayQueueUpdateReason.SetCurrentItem);
                 var updateSession = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
                 context.SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, updateSession, cancellationToken);
@@ -390,6 +386,7 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 && !prevState.Equals(GroupStateType.Playing)
                 && request.PositionTicks >= context.PositionTicks - maxPlaybackOffsetTicks)
             {
+                context.RetireRecovery(session);
                 HandleRequest(
                     new ReadyGroupRequest(request.When, request.PositionTicks, false, request.PlaylistItemId),
                     context,
@@ -404,10 +401,15 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // Resume playback when all ready.
                 ResumePlaying = true;
 
+                var currentTime = DateTime.UtcNow;
+                var scheduledStart = context.LastActivity;
+
+                // This session buffering again invalidates its own recovery; its readiness is
+                // reevaluated when it reports ready again.
+                context.RetireRecovery(session);
                 context.SetBuffering(session, true);
 
                 // Pause group and compute the media playback position.
-                var currentTime = DateTime.UtcNow;
                 var elapsedTime = currentTime - context.LastActivity;
                 context.LastActivity = currentTime;
                 // Elapsed time is negative if event happens
@@ -418,28 +420,35 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // Seek only if playback actually started.
                 context.PositionTicks += Math.Max(elapsedTime.Ticks, 0);
 
-                // A session that was catching up is still playing towards the group position.
-                // Pausing it here would seek it forward to the group position and skip content,
-                // so keep it playing and make the next resume wait for it.
-                var catchUpIsActive = context.CatchUpUntil > currentTime
-                    && !string.Equals(context.CatchUpSessionId, session.Id, StringComparison.OrdinalIgnoreCase);
-                if (!catchUpIsActive)
-                {
-                    ClearCatchUp(context);
-                }
+                // The resume planned for the previous state is obsolete now that the group is
+                // waiting again. The commands sent below replace the ones clients have scheduled.
+                context.ClearRecoveryResumes();
 
-                // Send pause command to all non-buffering sessions, except the one catching up.
+                // A recovering session is still playing towards the frozen group position.
+                // Pausing it right away would seek it forward and skip content, so keep it
+                // playing and schedule its stop at the position for when it is expected there.
+                context.ScheduleRecoveryStops(currentTime, cancellationToken);
+
+                // Send pause command to all non-buffering sessions that are not recovering.
                 var command = context.NewSyncPlayCommand(SendCommandType.Pause);
-                var broadcastType = catchUpIsActive ? SyncPlayBroadcastType.AllReadyExceptCatchUp : SyncPlayBroadcastType.AllReady;
-                context.SendCommand(session, broadcastType, command, cancellationToken);
+                context.SendCommand(session, SyncPlayBroadcastType.AllReadyExceptCatchUp, command, cancellationToken);
+
+                if (scheduledStart > currentTime)
+                {
+                    // The buffering session is not playing, but it still has the resume scheduled
+                    // by the previous plan. Replace it with a pause at the same time, so that the
+                    // group does not start playing through an unready session.
+                    var cancelCommand = context.NewSyncPlayCommand(SendCommandType.Pause);
+                    cancelCommand.When = scheduledStart;
+                    context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, cancelCommand, cancellationToken);
+                }
             }
             else if (prevState.Equals(GroupStateType.Paused))
             {
                 // Don't resume playback when all ready.
                 ResumePlaying = false;
 
-                ClearCatchUp(context);
-
+                context.RetireRecovery(session);
                 context.SetBuffering(session, true);
 
                 // Send pause command to buffering session.
@@ -449,13 +458,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             else if (prevState.Equals(GroupStateType.Waiting))
             {
                 // Another session is now buffering.
+                context.RetireRecovery(session);
                 context.SetBuffering(session, true);
-
-                if (string.Equals(context.CatchUpSessionId, session.Id, StringComparison.OrdinalIgnoreCase))
-                {
-                    // The catching-up session is buffering again, it is no longer catching up.
-                    ClearCatchUp(context);
-                }
 
                 if (!ResumePlaying)
                 {
@@ -483,6 +487,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
                 _logger.LogDebug("Session {SessionId} reported wrong playlist item in group {GroupId}.", session.Id, context.GroupId.ToString());
+
+                // The report belongs to a previous playback timeline; a recovery for it cannot
+                // be trusted against the item the group is playing now.
+                context.RetireRecovery(session);
 
                 var playQueueUpdate = context.GetPlayQueueUpdate(PlayQueueUpdateReason.SetCurrentItem);
                 var update = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
@@ -535,12 +543,14 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // advancing while the group waits, so it reports the same stale position again
                 // after the seek and would be corrected forever, stalling the group on its wait
                 // timeout. A second report is accepted and the resume command repositions it.
+                var wasCorrected = false;
                 if (Math.Abs(delayTicks) > maxOffsetTicks)
                 {
                     if (CorrectedSessions.Add(session.Id))
                     {
                         // Session not ready at all.
                         context.SetBuffering(session, true);
+                        context.RetireRecovery(session);
 
                         // Correcting session's position.
                         var command = context.NewSyncPlayCommand(SendCommandType.Seek);
@@ -553,16 +563,27 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                         return;
                     }
 
+                    // The session has already been corrected in this wait; accepting it avoids a
+                    // correction loop, but its position must not be trusted as a recovery plan.
+                    wasCorrected = true;
                     _logger.LogWarning("Session {SessionId} is still out of position after correction, accepting it to avoid a correction loop.", session.Id);
                 }
 
                 // Session is ready.
                 context.SetBuffering(session, false);
 
-                if (string.Equals(context.CatchUpSessionId, session.Id, StringComparison.OrdinalIgnoreCase))
+                var latencyThresholdTicks = context.GetHighestPing() * 2 * TimeSpan.TicksPerMillisecond;
+                if (!wasCorrected && delayTicks > latencyThresholdTicks)
                 {
-                    // The catching-up session reached the group position on its own.
-                    ClearCatchUp(context);
+                    // The session is behind but still playing: it is recovering from the buffer,
+                    // not lost. Remember when it is expected to reach the group position.
+                    context.StartRecovery(session, currentTime.AddTicks(delayTicks));
+                }
+                else
+                {
+                    // The session is at the group position, or was already corrected: any
+                    // previous recovery for it is complete and must stop delaying the group.
+                    context.RetireRecovery(session);
                 }
 
                 if (context.IsBuffering())
@@ -576,52 +597,11 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 }
                 else
                 {
-                    // If all ready, then start playback.
-                    // Let other clients resume as soon as the buffering client catches up.
-                    var minResumeDelayTicks = Math.Max(
-                        context.GetHighestPing() * 2 * TimeSpan.TicksPerMillisecond,
-                        TimeSpan.FromMilliseconds(context.DefaultPing).Ticks);
+                    // If all ready, start playback no earlier than the latency allowance and the
+                    // time every session that is still recovering needs to reach the position.
+                    var resumeAt = context.StartGroupPlayback(session, cancellationToken);
 
-                    if (delayTicks > context.GetHighestPing() * 2 * TimeSpan.TicksPerMillisecond
-                        && delayTicks <= maxOffsetTicks)
-                    {
-                        // Client that was buffering is recovering, notifying others to resume.
-                        var catchUpUntil = currentTime.AddTicks(delayTicks);
-                        context.LastActivity = catchUpUntil;
-                        context.CatchUpSessionId = session.Id;
-                        context.CatchUpUntil = catchUpUntil;
-
-                        var command = context.NewSyncPlayCommand(SendCommandType.Unpause);
-                        var filter = SyncPlayBroadcastType.AllExceptCurrentSession;
-                        if (!request.IsPlaying)
-                        {
-                            filter = SyncPlayBroadcastType.AllGroup;
-                        }
-
-                        context.SendCommand(session, filter, command, cancellationToken);
-
-                        _logger.LogInformation("Session {SessionId} is recovering, group {GroupId} will resume in {Delay} seconds.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(delayTicks).TotalSeconds);
-                    }
-                    else
-                    {
-                        // Client, that was buffering, resumed playback but did not update others in time.
-                        var resumeAt = currentTime.AddTicks(minResumeDelayTicks);
-                        if (context.CatchUpUntil > resumeAt)
-                        {
-                            // Another session is still catching up; resume when it reaches the
-                            // group position instead of cancelling its catch-up.
-                            resumeAt = context.CatchUpUntil.Value;
-                        }
-
-                        delayTicks = (resumeAt - currentTime).Ticks;
-                        context.LastActivity = resumeAt;
-                        ClearCatchUp(context);
-
-                        var command = context.NewSyncPlayCommand(SendCommandType.Unpause);
-                        context.SendCommand(session, SyncPlayBroadcastType.AllGroup, command, cancellationToken);
-
-                        _logger.LogWarning("Session {SessionId} resumed playback, group {GroupId} has {Delay} seconds to recover.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(delayTicks).TotalSeconds);
-                    }
+                    _logger.LogInformation("Session {SessionId} resumed playback, group {GroupId} will resume in {Delay} seconds.", session.Id, context.GroupId.ToString(), (resumeAt - currentTime).TotalSeconds);
 
                     // Change state.
                     var playingState = new PlayingGroupState(LoggerFactory);
@@ -684,8 +664,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             ResumePlaying = true;
 
-            ClearCatchUp(context);
-
             // Make sure the client knows the playing item, to avoid duplicate requests.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
@@ -733,8 +711,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             ResumePlaying = true;
 
-            ClearCatchUp(context);
-
             // Make sure the client knows the playing item, to avoid duplicate requests.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
@@ -775,11 +751,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         {
             context.SetIgnoreGroupWait(session, request.IgnoreWait);
 
-            if (string.Equals(context.CatchUpSessionId, session.Id, StringComparison.OrdinalIgnoreCase))
-            {
-                ClearCatchUp(context);
-            }
-
             if (!context.IsBuffering())
             {
                 _logger.LogDebug("Ignoring session {SessionId}, group {GroupId} is ready.", session.Id, context.GroupId.ToString());
@@ -799,16 +770,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     context.SetState(pausedState);
                 }
             }
-        }
-
-        /// <summary>
-        /// Clears the session that is catching up to the group position, if any.
-        /// </summary>
-        /// <param name="context">The group state context.</param>
-        private static void ClearCatchUp(IGroupStateContext context)
-        {
-            context.CatchUpSessionId = null;
-            context.CatchUpUntil = null;
         }
     }
 }
