@@ -2763,6 +2763,574 @@ public class WaitingGroupStateTests
         Assert.Equal(groupStart, group.LastActivity);
     }
 
+    /// <summary>
+    /// Starts a playing group whose first member is finishing a 300-millisecond recovery while
+    /// the second member is genuinely loading. Returns after the first member's stop at the
+    /// target has taken effect, with the captured commands cleared.
+    /// </summary>
+    private static async Task<(GroupHarness Harness, Guid PlaylistItemId, long Position)> StartCompletionWhileAnotherMemberLoads()
+    {
+        var (harness, playlistItemId) = StartPlayingGroup(ping: 1200);
+        var group = harness.Group;
+        var position = group.PositionTicks;
+
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.First,
+            new ReadyGroupRequest(DateTime.UtcNow, position - TimeSpan.FromMilliseconds(300).Ticks, true, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+
+        // The second member starts genuinely buffering before the first one completes, so the
+        // group waits and the first member's stop at the target is scheduled.
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        // Let the scheduled stop take effect while the second member still loads.
+        await Task.Delay(450, TestContext.Current.CancellationToken);
+        var stop = harness.CommandsTo(harness.First.Id, SendCommandType.Pause)[^1];
+        Assert.True(stop.When < DateTime.UtcNow);
+        Assert.Equal(position, stop.PositionTicks);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        return (harness, playlistItemId, position);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CompletionReportedWhileWaiting_RemainsRecognizedAfterTheNextStart(bool readyReport)
+    {
+        var (harness, playlistItemId, position) = await StartCompletionWhileAnotherMemberLoads();
+        var group = harness.Group;
+
+        // The first member reports that it completed its recovery while the group still waits.
+        // Its advancing deadline is over, but its valid stop at the target must survive the
+        // report so that the next plan can still recognize it.
+        ReportCompletion(group, harness.First, readyReport, position, playlistItemId);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering(), "only the second member should still be loading");
+
+        // Nothing resumes the completed member before the group actually starts.
+        Assert.DoesNotContain(harness.DeliveredCommands, delivery => delivery.Command.Command == SendCommandType.Unpause);
+
+        // The second member reports ready: the group starts after the latency allowance and
+        // includes the stopped member in its resume plan.
+        var beforeStart = DateTime.UtcNow;
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+        Assert.True(groupStart > beforeStart);
+        Assert.InRange(groupStart - beforeStart, TimeSpan.FromMilliseconds(2200), TimeSpan.FromMilliseconds(2700));
+
+        var firstResume = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
+        Assert.Equal(groupStart, firstResume.When);
+        Assert.Equal(position, firstResume.PositionTicks);
+
+        // The other ready member's plan points at the same start.
+        var secondResume = Assert.Single(harness.CommandsTo(harness.Second.Id, SendCommandType.Unpause));
+        Assert.Equal(groupStart, secondResume.When);
+
+        Assert.All(
+            harness.DeliveredCommands.Where(delivery => delivery.Command.Command == SendCommandType.Unpause),
+            delivery => Assert.Equal(groupStart, delivery.Command.When));
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // Repeated sweeps must not add playback actions or move the start.
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow);
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow.AddSeconds(10));
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.Equal(groupStart, group.LastActivity);
+        Assert.Empty(harness.DeliveredCommands);
+
+        // Another pause-induced Buffer from the same stop arrives before the start. It must not
+        // restart the wait or replace the resume that is already planned.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.False(group.IsBuffering());
+        Assert.Equal(groupStart, group.LastActivity);
+        Assert.Empty(harness.DeliveredCommands);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepeatedCompletionReportsAtTheRecoveryStop_KeepTheSameStartPlan(bool bufferFirst)
+    {
+        var (harness, playlistItemId, position) = await StartCompletionWhileAnotherMemberLoads();
+        var group = harness.Group;
+
+        // The player emits both pause-induced reports at the completed stop, in either order.
+        // Neither may make the completed member a blocking loader again.
+        foreach (var readyReport in new[] { !bufferFirst, bufferFirst })
+        {
+            ReportCompletion(group, harness.First, readyReport, position, playlistItemId);
+            Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+            Assert.True(group.IsBuffering());
+            Assert.DoesNotContain(harness.DeliveredCommands, delivery => delivery.Command.Command == SendCommandType.Unpause);
+        }
+
+        // The second member reports ready: the group plans a start after the latency allowance.
+        var beforeStart = DateTime.UtcNow;
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+        Assert.InRange(groupStart - beforeStart, TimeSpan.FromMilliseconds(2200), TimeSpan.FromMilliseconds(2700));
+        var plannedResumes = harness.CommandsTo(harness.First.Id, SendCommandType.Unpause);
+        Assert.NotEmpty(plannedResumes);
+        Assert.All(plannedResumes, command => Assert.Equal(groupStart, command.When));
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // After the start is scheduled, the same reports are repeated before it happens. A Buffer
+        // belongs to the completed stop; a Ready redispatches the same resume for the same start.
+        foreach (var readyReport in new[] { bufferFirst, !bufferFirst })
+        {
+            ReportCompletion(group, harness.First, readyReport, position, playlistItemId);
+        }
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.False(group.IsBuffering());
+        Assert.Equal(groupStart, group.LastActivity);
+        Assert.Empty(harness.CommandsTo(harness.First.Id, SendCommandType.Pause));
+        Assert.Empty(harness.CommandsTo(harness.First.Id, SendCommandType.Seek));
+        Assert.All(
+            harness.CommandsTo(harness.First.Id, SendCommandType.Unpause),
+            command => Assert.Equal(groupStart, command.When));
+
+        // Repeated sweeps keep the same effective plan.
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow);
+        harness.PumpScheduledRecoveryResumes(DateTime.UtcNow.AddSeconds(10));
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.Equal(groupStart, group.LastActivity);
+        Assert.All(
+            harness.CommandsTo(harness.First.Id, SendCommandType.Unpause),
+            command => Assert.Equal(groupStart, command.When));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PausedCompletionReportWithoutAStopPlan_DoesNotCreateRecognition(bool readyReport)
+    {
+        var (harness, playlistItemId) = StartPlayingGroup(ping: 1200);
+        var group = harness.Group;
+        var position = group.PositionTicks;
+
+        // Both members are genuinely loading, so no recovery or stop plan exists for either.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // A paused report at the target is accepted Ready processing, not a planned stop. It must
+        // not invent stop recognition for the next plan.
+        ReportCompletion(group, harness.First, readyReport, position, playlistItemId);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering(), "the second member should still be loading");
+
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.True(group.LastActivity > DateTime.UtcNow);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // Without a matching stop plan the same paused report is ordinary buffering.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CompletionAfterARecoveryStartedWhileWaiting_RemainsRecognized(bool readyReport)
+    {
+        var (harness, playlistItemId) = StartPlayingGroup(ping: 1200);
+        var group = harness.Group;
+        var position = group.PositionTicks;
+
+        // Both members buffer, so the group waits for both of them.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        // The first member comes back still playing 300 ms behind, so its recovery starts while
+        // the group is already waiting for the second member.
+        var beforeReady = DateTime.UtcNow;
+        group.HandleRequest(
+            harness.First,
+            new ReadyGroupRequest(DateTime.UtcNow, position - TimeSpan.FromMilliseconds(300).Ticks, true, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        var stop = harness.CommandsTo(harness.First.Id, SendCommandType.Pause)[^1];
+        Assert.InRange(stop.When, beforeReady, beforeReady.AddSeconds(1));
+        Assert.Equal(position, stop.PositionTicks);
+
+        // The stop deadline passes while the second member still loads.
+        await Task.Delay(450, TestContext.Current.CancellationToken);
+        Assert.True(stop.When < DateTime.UtcNow);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The first member completes at the target. The stop it was sent must stay recognized
+        // even though its recovery was created while the group was already waiting.
+        ReportCompletion(group, harness.First, readyReport, position, playlistItemId);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering());
+
+        // The second member is ready: the group starts after the latency allowance and resumes
+        // the stopped member.
+        var beforeStart = DateTime.UtcNow;
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+        Assert.InRange(groupStart - beforeStart, TimeSpan.FromMilliseconds(2200), TimeSpan.FromMilliseconds(2700));
+
+        var resume = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
+        Assert.Equal(groupStart, resume.When);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The duplicate pause-induced report still belongs to the completed stop.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.False(group.IsBuffering());
+        Assert.Equal(groupStart, group.LastActivity);
+        Assert.Empty(harness.DeliveredCommands);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CompletionBeforeTheRecoveryDeadline_RemovesTheAdvancingDeadline(bool readyReport)
+    {
+        var (harness, playlistItemId) = StartPlayingGroup(ping: 1200);
+        var group = harness.Group;
+        var position = group.PositionTicks;
+
+        // The first member comes back five seconds behind while it is the only one loading.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        group.HandleRequest(
+            harness.First,
+            new ReadyGroupRequest(DateTime.UtcNow, position - TimeSpan.FromSeconds(5).Ticks, true, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.InRange(group.LastActivity - DateTime.UtcNow, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(6));
+
+        // The second member buffers and keeps the group waiting. The first member's stop is
+        // scheduled at its five-second recovery deadline.
+        group.HandleRequest(
+            harness.Second,
+            new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(harness.CommandsTo(harness.First.Id, SendCommandType.Pause)[^1].When > DateTime.UtcNow.AddSeconds(3));
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The first member reports itself stopped at the target before its expected completion.
+        ReportCompletion(group, harness.First, readyReport, position, playlistItemId);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        // The second member is ready: the start uses the latency allowance, not the completed
+        // five-second deadline.
+        var beforeStart = DateTime.UtcNow;
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+        Assert.InRange(groupStart - beforeStart, TimeSpan.FromMilliseconds(2200), TimeSpan.FromMilliseconds(2700));
+
+        var resume = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
+        Assert.Equal(groupStart, resume.When);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The stop recognition survives the removed deadline.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.False(group.IsBuffering());
+        Assert.Equal(groupStart, group.LastActivity);
+        Assert.Empty(harness.DeliveredCommands);
+    }
+
+    [Theory]
+    [InlineData("playing-buffer")]
+    [InlineData("stale-item")]
+    [InlineData("ahead-ready")]
+    [InlineData("behind-ready")]
+    public async Task InvalidReportAtARecognizedStop_DoesNotRetainRecognition(string report)
+    {
+        var (harness, playlistItemId, position) = await StartCompletionWhileAnotherMemberLoads();
+        var group = harness.Group;
+
+        switch (report)
+        {
+            case "playing-buffer":
+                group.HandleRequest(
+                    harness.First,
+                    new BufferGroupRequest(DateTime.UtcNow, position, true, playlistItemId),
+                    CancellationToken.None);
+                break;
+            case "stale-item":
+                group.HandleRequest(
+                    harness.First,
+                    new BufferGroupRequest(DateTime.UtcNow, position, false, harness.PlaylistItemId),
+                    CancellationToken.None);
+                break;
+            case "ahead-ready":
+                group.HandleRequest(
+                    harness.First,
+                    new ReadyGroupRequest(DateTime.UtcNow, position + TimeSpan.FromSeconds(2).Ticks, false, playlistItemId),
+                    CancellationToken.None);
+                break;
+            case "behind-ready":
+                group.HandleRequest(
+                    harness.First,
+                    new ReadyGroupRequest(DateTime.UtcNow, position - TimeSpan.FromSeconds(2).Ticks, false, playlistItemId),
+                    CancellationToken.None);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(report), report, "Unknown report kind.");
+        }
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering(), "the invalid report must be treated as loading");
+
+        // The player applies the correction, or reports ready again, at the target.
+        group.HandleRequest(
+            harness.First,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.True(group.LastActivity > DateTime.UtcNow);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // No valid stop remains, so the same report at the target is ordinary buffering.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+        Assert.True(group.IsBuffering());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task JoinerAfterACompletionWhileWaiting_CarriesTheValidStopIntoTheNewStart(bool readyReport)
+    {
+        var (harness, playlistItemId, position) = await StartCompletionWhileAnotherMemberLoads();
+        var group = harness.Group;
+
+        // The first member completes its recovery while the group still waits for the second.
+        ReportCompletion(group, harness.First, readyReport, position, playlistItemId);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // A joiner replans the group start. The completed stop is valid under the new plan.
+        var joiner = harness.NewSession("joiner");
+        group.SessionJoin(joiner, new JoinGroupRequest(group.GroupId), CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        var beforeStart = DateTime.UtcNow;
+        group.HandleRequest(
+            joiner,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+        Assert.InRange(groupStart - beforeStart, TimeSpan.FromMilliseconds(2200), TimeSpan.FromMilliseconds(2700));
+
+        var resume = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
+        Assert.Equal(groupStart, resume.When);
+        Assert.Equal(position, resume.PositionTicks);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The delayed report from the completed stop still belongs to the replanned start.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.False(group.IsBuffering());
+        Assert.Equal(groupStart, group.LastActivity);
+        Assert.Empty(harness.DeliveredCommands);
+    }
+
+    [Fact]
+    public async Task JoinerRecovery_DoesNotDisturbAnAlreadyRecognizedStop()
+    {
+        var (harness, playlistItemId, position) = await StartCompletionWhileAnotherMemberLoads();
+        var group = harness.Group;
+
+        // The first member completes at the target while the second is still loading.
+        ReportCompletion(group, harness.First, readyReport: true, position, playlistItemId);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // A joiner arrives and needs five seconds to catch up. Its recovery is independent of
+        // the completed member's recognized stop.
+        var joiner = harness.NewSession("joiner");
+        group.SessionJoin(joiner, new JoinGroupRequest(group.GroupId), CancellationToken.None);
+        group.HandleRequest(
+            joiner,
+            new ReadyGroupRequest(DateTime.UtcNow, position - TimeSpan.FromSeconds(5).Ticks, true, playlistItemId),
+            CancellationToken.None);
+        Assert.Equal(GroupStateType.Waiting, group.GetInfo().State);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The loading member becomes ready: the start is set by the joiner's recovery, and the
+        // completed member's stop is carried into it.
+        var beforeStart = DateTime.UtcNow;
+        group.HandleRequest(
+            harness.Second,
+            new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        var groupStart = group.LastActivity;
+        Assert.InRange(groupStart - beforeStart, TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(6));
+
+        var resume = Assert.Single(harness.CommandsTo(harness.First.Id, SendCommandType.Unpause));
+        Assert.Equal(groupStart, resume.When);
+
+        harness.Commands.Clear();
+        harness.DeliveredCommands.Clear();
+
+        // The completed stop remains valid under the start planned around the joiner's recovery.
+        group.HandleRequest(
+            harness.First,
+            new BufferGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+            CancellationToken.None);
+
+        Assert.Equal(GroupStateType.Playing, group.GetInfo().State);
+        Assert.False(group.IsBuffering());
+        Assert.Equal(groupStart, group.LastActivity);
+        Assert.Empty(harness.DeliveredCommands);
+    }
+
+    private static void ReportCompletion(
+        SyncPlayGroup group,
+        SessionInfo session,
+        bool readyReport,
+        long position,
+        Guid playlistItemId)
+    {
+        if (readyReport)
+        {
+            group.HandleRequest(
+                session,
+                new ReadyGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+                CancellationToken.None);
+        }
+        else
+        {
+            group.HandleRequest(
+                session,
+                new BufferGroupRequest(DateTime.UtcNow, position, false, playlistItemId),
+                CancellationToken.None);
+        }
+    }
+
     private sealed class GroupHarness
     {
         private readonly ISessionManager _sessionManager;

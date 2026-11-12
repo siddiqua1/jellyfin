@@ -78,6 +78,18 @@ namespace MediaBrowser.Controller.SyncPlay
         void StartRecovery(SessionInfo session, DateTime expectedCompletion);
 
         /// <summary>
+        /// Marks the advancing recovery of a session as finished, without discarding the valid
+        /// stop the current plan still expects it to wait at.
+        /// </summary>
+        /// <remarks>
+        /// This is the natural completion of a recovery, not its cancellation. The advancing
+        /// deadline no longer delays the group, but a matching recovery stop keeps its
+        /// recognition until the plan is superseded.
+        /// </remarks>
+        /// <param name="session">The session.</param>
+        void CompleteRecovery(SessionInfo session);
+
+        /// <summary>
         /// Retires the recovery of a session, if any.
         /// </summary>
         /// <param name="session">The session.</param>

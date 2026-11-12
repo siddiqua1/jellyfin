@@ -10,8 +10,8 @@ outcome.
 ## Status
 
 Live playback verification is **pending**. No deployment was exercised while implementing this
-change. The automated suite passes; the observed server-command outcomes are described per
-scenario below.
+change or its completion-recognition follow-up. The automated suite passes; the observed
+server-command outcomes are described per scenario below.
 
 Automated coverage that backs the scenarios:
 
@@ -21,6 +21,20 @@ dotnet test tests/Jellyfin.Server.Implementations.Tests \
 dotnet test tests/Jellyfin.Server.Integration.Tests \
     --filter "FullyQualifiedName~SyncPlay"
 ```
+
+Last verified on 2026-11-11: Jellyfin.Server.Implementations.Tests (1163 passed, 12 skipped) and
+Jellyfin.Server.Integration.Tests with the SyncPlay filter (3 passed). The integration project
+needs `libfontconfig1` on Linux; without it the Skia font manager fails during host startup.
+
+The completion-recognition follow-up is covered by
+`CompletionReportedWhileWaiting_RemainsRecognizedAfterTheNextStart` (Buffer-first and Ready-first
+variants), `CompletionAfterARecoveryStartedWhileWaiting_RemainsRecognized`,
+`CompletionBeforeTheRecoveryDeadline_RemovesTheAdvancingDeadline`,
+`RepeatedCompletionReportsAtTheRecoveryStop_KeepTheSameStartPlan`,
+`PausedCompletionReportWithoutAStopPlan_DoesNotCreateRecognition`,
+`InvalidReportAtARecognizedStop_DoesNotRetainRecognition`,
+`JoinerAfterACompletionWhileWaiting_CarriesTheValidStopIntoTheNewStart`, and
+`JoinerRecovery_DoesNotDisturbAnAlreadyRecognizedStop`.
 
 ## Prerequisites
 
@@ -153,6 +167,25 @@ client-side network inspector showing `SyncPlayCommand` messages with `Command`,
    blocking loader, and no timeout wait appears. A report more than the accepted position
    tolerance away from the target, after the scheduled start, with a stale item, or without a
    matching recovery stop must still follow normal buffering handling.
+
+## Scenario M: completion reported while another member still loads
+
+1. Set up a recovery that finishes while another member is genuinely buffering, so the group is
+   waiting for that loader. Let the recovering member's stop at the target take effect.
+2. While the loader is still buffering, have the recovered member report its paused completion at
+   the target: first through the player's pause-induced Buffer event, and in a fresh run through a
+   direct paused Ready report.
+3. Let the loading member become ready. The group schedules a start after the normal latency
+   allowance and includes the recovered member in that resume.
+4. Before that start, have the recovered member's player repeat its paused Buffer report at the
+   same target, and in a fresh run repeat a paused Ready report instead. Supply no further Ready.
+5. Expected: the group stays Playing with the same scheduled start, the recovered member is not a
+   new blocking loader, and its effective resume remains the scheduled start. No replacement
+   Pause, Seek or new group wait appears, and repeating the periodic sweep does not change the
+   plan.
+6. Repeat with a third member joining during the wait, and separately with a membership change
+   after the completion report, to confirm the stop is carried only into the replanned start that
+   still expects it. Observe the playback separately from the simulated server request ordering.
 
 ## Recorded outcomes
 

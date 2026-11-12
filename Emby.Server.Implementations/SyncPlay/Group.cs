@@ -206,14 +206,45 @@ namespace Emby.Server.Implementations.SyncPlay
                 return;
             }
 
+            var playlistItemId = PlayQueue.GetPlayingItemPlaylistId();
+            var targetPositionTicks = PositionTicks;
+
             _recoveries[session.Id] = new PlaybackRecovery(
                 session.Id,
-                PlayQueue.GetPlayingItemPlaylistId(),
-                PositionTicks,
+                playlistItemId,
+                targetPositionTicks,
                 expectedCompletion);
 
             // A new deadline supersedes the stop and the resume deferred for the previous one.
-            _recoveryStops.Remove(session.Id);
+            // The session is still expected to wait at the group position, so its stop stays
+            // planned until the next group start assigns the actual resume time. This also covers
+            // a recovery that starts while the group is already waiting for another member.
+            _recoveryStops[session.Id] = new RecoveryStop(
+                playlistItemId,
+                targetPositionTicks,
+                DateTime.MaxValue,
+                null);
+        }
+
+        /// <inheritdoc />
+        public void CompleteRecovery(SessionInfo session)
+        {
+            if (session is null || string.IsNullOrEmpty(session.Id))
+            {
+                return;
+            }
+
+            // The advancing phase is over: the session either reached the group position or
+            // reported itself stopped. Its deadline must not keep delaying the group.
+            _recoveries.Remove(session.Id);
+
+            // The stop the current plan expects the session to wait at is a different fact and
+            // stays recognized. It cannot outlive the timeline, the membership or the wait policy,
+            // and it is never created here: a completion without a matching stop plan is a no-op.
+            if (_recoveryStops.TryGetValue(session.Id, out var stop) && !IsCurrentPlanStop(session.Id, stop))
+            {
+                _recoveryStops.Remove(session.Id);
+            }
         }
 
         /// <inheritdoc />
@@ -253,8 +284,22 @@ namespace Emby.Server.Implementations.SyncPlay
                 return false;
             }
 
-            return MatchesCurrentPlan(stop)
+            return IsCurrentPlanStop(session.Id, stop)
                 && Math.Abs((decimal)positionTicks - stop.TargetPositionTicks) <= MaxPlaybackOffsetTicks;
+        }
+
+        /// <summary>
+        /// Checks whether a recovery stop belongs to the current playback timeline and to a session
+        /// that still follows the group wait.
+        /// </summary>
+        /// <param name="sessionId">The session identifier.</param>
+        /// <param name="stop">The stop.</param>
+        /// <returns><c>true</c> if the session is still expected to wait at the stop; <c>false</c> otherwise.</returns>
+        private bool IsCurrentPlanStop(string sessionId, RecoveryStop stop)
+        {
+            return _participants.TryGetValue(sessionId, out var member)
+                && !member.IgnoreGroupWait
+                && MatchesCurrentPlan(stop);
         }
 
         /// <summary>
@@ -374,7 +419,7 @@ namespace Emby.Server.Implementations.SyncPlay
 
             if (_recoveryStops.TryGetValue(session.Id, out var stop)
                 && stop.ExpectedResumeAt.Equals(LastActivity)
-                && MatchesCurrentPlan(stop))
+                && IsCurrentPlanStop(session.Id, stop))
             {
                 // The session already stopped at the position; deliver the resume it is owed at
                 // the planned start.
@@ -445,9 +490,7 @@ namespace Emby.Server.Implementations.SyncPlay
 
             foreach (var (sessionId, stop) in previousStops)
             {
-                if (recoveringSessions.Contains(sessionId)
-                    || !_participants.ContainsKey(sessionId)
-                    || !MatchesCurrentPlan(stop))
+                if (recoveringSessions.Contains(sessionId) || !IsCurrentPlanStop(sessionId, stop))
                 {
                     continue;
                 }

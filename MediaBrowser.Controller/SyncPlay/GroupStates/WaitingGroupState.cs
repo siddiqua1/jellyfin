@@ -394,7 +394,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 && !prevState.Equals(GroupStateType.Playing)
                 && request.PositionTicks >= context.PositionTicks - maxPlaybackOffsetTicks)
             {
-                context.RetireRecovery(session);
+                // The session reports itself stopped at the group position: its advancing
+                // recovery is over, but a valid stop the plan expects it to wait at stays
+                // recognized through the synthetic Ready processing below.
+                context.CompleteRecovery(session);
                 HandleRequest(
                     new ReadyGroupRequest(request.When, request.PositionTicks, false, request.PlaylistItemId),
                     context,
@@ -591,8 +594,9 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 else
                 {
                     // The session is at the group position, is paused, or was already corrected:
-                    // any previous recovery for it is complete and must stop delaying the group.
-                    context.RetireRecovery(session);
+                    // its advancing recovery is complete and must stop delaying the group, but a
+                    // matching stop the current plan still expects it to wait at stays recognized.
+                    context.CompleteRecovery(session);
                 }
 
                 if (context.IsBuffering())
